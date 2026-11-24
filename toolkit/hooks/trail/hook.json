@@ -1,0 +1,7 @@
+{
+  "description": "After every answer, note where the work stands so the next session, Claude or Codex, can pick it up",
+  "event": "Stop",
+  "matcher": null,
+  "timeout": 10,
+  "codex": { "matcher": null }
+}

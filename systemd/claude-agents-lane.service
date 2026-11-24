@@ -1,0 +1,10 @@
+[Unit]
+Description=Move agent work (Claude Code daemons, sessions, claude-mem) that runs outside agents.slice into it
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-agents-lane adopt
+Slice=background.slice
+Nice=10
+TimeoutStartSec=45

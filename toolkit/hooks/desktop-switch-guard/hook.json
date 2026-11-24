@@ -1,0 +1,8 @@
+{
+  "description": "Denies a Bash command that would switch the desktop the user is looking at (claude-desks goto/resume/focus/new without --stay, wmctrl -s, a KWin current-desktop call); a Claude places windows by desktop id instead (desktop-switch-guard.js)",
+  "event": "PreToolUse",
+  "matcher": "Bash",
+  "timeout": 5,
+  "runtime": "bun",
+  "codex": { "matcher": "Bash" }
+}

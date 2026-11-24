@@ -1,0 +1,9 @@
+[Unit]
+Description=Agent work: Claude Code daemons, their sessions, test runs and browsers
+
+[Slice]
+CPUWeight=20
+
+CPUQuota=1800%
+MemoryHigh=44G
+MemorySwapMax=16G

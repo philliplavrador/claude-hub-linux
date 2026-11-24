@@ -1,0 +1,12 @@
+[Unit]
+Description=Stop a runaway process in agents.slice: any one program over 16 GB, or the biggest when the lane stalls
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/claude-agents-ceiling watch
+Restart=always
+RestartSec=5
+Slice=app.slice
+
+[Install]
+WantedBy=default.target

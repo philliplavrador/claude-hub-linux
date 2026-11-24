@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""claude-agent-screen: the door to the guard that agents never put a window on your screen.
+
+Every Claude runs this before every Bash command (the PreToolUse hook, `guard`), at SessionStart (`session-env`)
+and, as a service, as `watch`. Python compiles a script on every run but keeps the compiled form of a module, so
+the code is in lib/claude-agent-screen/agent_screen.py and this file only loads it by path and runs its main().
+Its usage text and its rules are that file's. The second pass of the guard reads that folder like any other
+lib/ folder (this tool is on its _LIB_TOOLS list).
+
+A guard that cannot be loaded must refuse, never let the command run: Claude Code treats exit 1, exit 127 and a
+killed hook as "let it run" and blocks only on exit 2. So any failure to load the body (missing, unreadable,
+a syntax error, a corrupt cache, a copy cut short) exits 2 with nothing on stdout and the file and the error on
+stderr. Only the load is guarded here: a rule that raises while it decides is the body's own business.
+
+The load is tried up to three times, 0.1 s apart, and no new try starts once a second has passed since this file
+began: a copy being replaced at that moment may be whole a moment later, and Claude Code ends a hook that takes
+too long (and lets the command run). The first try uses the compiled copy; the others compile the source, so a
+damaged compiled copy cannot refuse every command. When a later try is the one that worked, the compiled copy
+is removed (unlinked, nothing else) and one line says so in agent-screen.log, so the next call writes a good one.
+A refusal reads what the caller wrote to stdin first (a closed pipe would hand it an error instead of the answer;
+it stops after 0.25 s of silence, 1 s in all, or 4 MiB, and never reads a terminal) and leaves one line in
+agent-screen.log: the file and the kind of error, never the command and never the error's own text. Any signal
+that lands while it refuses (a timer's SIGALRM turned into a KeyboardInterrupt, say) still ends in exit 2.
+"""
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+_NAME = "claude_agent_screen_body"
+_TRIES = 3
+_PAUSE = 0.1
+_DEADLINE = 1.0
+_DRAIN_IDLE = 0.25
+_DRAIN_TOTAL = 1.0
+_DRAIN_BYTES = 4 << 20
+
+
+def _import_body(spec, from_source):
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_NAME] = module
+    try:
+        if from_source:
+            code = spec.loader.source_to_code(spec.loader.get_data(spec.origin), spec.origin)
+            exec(code, module.__dict__)
+        else:
+            spec.loader.exec_module(module)
+        if not callable(getattr(module, "main", None)):
+            raise ImportError("the file has no main()")
+        if getattr(module, "_END_OF_GUARD", None) is not True:
+            raise ImportError("the file ends short: its last line, _END_OF_GUARD, did not run")
+        return module.main
+    except BaseException:
+        sys.modules.pop(_NAME, None)
+        raise
+
+
+def _drain_stdin():
+    try:
+        import os
+        import select
+        if os.isatty(0):
+            return
+        began = time.monotonic()
+        left_to_read = _DRAIN_BYTES
+        while left_to_read > 0:
+            wait = min(_DRAIN_IDLE, began + _DRAIN_TOTAL - time.monotonic())
+            if wait <= 0 or not select.select([0], [], [], wait)[0]:
+                return
+            chunk = os.read(0, 65536)
+            if not chunk:
+                return
+            left_to_read -= len(chunk)
+    except Exception:
+        pass
+
+
+def _log_line(text):
+    try:
+        import os
+        state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "claude-hub"
+        state.mkdir(parents=True, exist_ok=True)
+        with open(state / "agent-screen.log", "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+    except BaseException:
+        pass
+
+
+def _compiled_copy_out(body, spec, attempt, failure):
+    try:
+        import os
+        os.unlink(spec.cached)
+    except BaseException:
+        return
+    _log_line(f"the guard loaded from {body} only on try {attempt + 1}, after {type(failure).__name__}; "
+              "its compiled copy was removed")
+
+
+def _refuse(body, spec, failure):
+    where = body or "its lib folder"
+    kind = type(failure).__name__
+    try:
+        cached = None
+        try:
+            cached = spec.cached if spec is not None else None
+        except Exception:
+            pass
+        if sys.stderr is not None:
+            try:
+                print(f"claude-agent-screen: the guard cannot be loaded from {where} (compiled copy: {cached}), "
+                      f"so it refuses: {kind}: {failure}", file=sys.stderr)
+            except Exception:
+                pass
+        _log_line(f"the guard cannot be loaded from {where} ({kind}), so it refused")
+        _drain_stdin()
+    except BaseException:
+        pass
+    sys.exit(2)
+
+
+def _load():
+    started = time.monotonic()
+    body = spec = failure = None
+    for attempt in range(_TRIES):
+        try:
+            if attempt:
+                time.sleep(_PAUSE)
+                if time.monotonic() - started > _DEADLINE:
+                    break
+            if spec is None:
+                body = Path(__file__).resolve().parent.parent / "lib" / "claude-agent-screen" / "agent_screen.py"
+                spec = importlib.util.spec_from_file_location(_NAME, body)
+                if spec is None or spec.loader is None:
+                    raise ImportError("no loader for the file")
+            main = _import_body(spec, from_source=attempt > 0)
+        except BaseException as e:
+            failure = e
+            continue
+        if attempt:
+            _compiled_copy_out(body, spec, attempt, failure)
+        return main
+    _refuse(body, spec, failure)
+
+
+if __name__ == "__main__":
+    sys.exit(_load()(sys.argv))

@@ -1,0 +1,8 @@
+{
+  "description": "Stops background processes when a session ends and sweeps leftovers at session start (bg.js)",
+  "event": ["SessionStart", "SessionEnd"],
+  "args": ["hook"],
+  "matcher": null,
+  "timeout": 20,
+  "codex": { "matcher": null }
+}

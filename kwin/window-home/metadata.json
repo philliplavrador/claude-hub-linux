@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "claude-hub-linux"
+            }
+        ],
+        "Category": "Window Management",
+        "Description": "as requested: a window a Claude opens goes straight to that Claude's desktop as KWin creates it, never first onto the screen he is on. as requested: a window nobody claimed goes to the desktop of the Claude whose process opened it, once the service has said whose it is, and is not shown until KWin's open animation is over",
+        "EnabledByDefault": false,
+        "Id": "claude-window-home",
+        "License": "MIT",
+        "Name": "Claude hub window home",
+        "Version": "1"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

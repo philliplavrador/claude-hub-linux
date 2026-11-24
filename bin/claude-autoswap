@@ -1,0 +1,1832 @@
+#!/usr/bin/env python3
+"""claude-autoswap: every Claude moves to another subscription, same conversation, just before it hits a 5-hour, week
+or Fable limit.
+
+Every decision is arithmetic on the meters, never a model call. An account the usage endpoint answers with no
+`session` entry has no 5-hour limit: its meters entry carries `no_five_hour`, its 5-hour reads 0.0 with no reset, and
+`status` prints `5h none`; the 5-hour rules below still protect every account that has the limit.
+
+  must leave   week >= 100, Fable >= 100 (Fable Claudes), 5-hour + speed x 10 min >= 100, or 5-hour >= 98; or it hit a
+               limit and its own account still blocks it (a week's last 2 % is used too: a Claude runs into the limit
+               and moves on by itself with "continue"). Claude Code's own "usage limit reached, a short grace
+               allowance remains" counts as that hit. The two 5-hour rules wait when that window refills within 10
+               minutes, since a move would re-read the whole conversation elsewhere for room it gets back in minutes.
+               Rule 7, stranded: its own last answer was a sign-in failure and its account is signed out now. Nothing
+               on a signed-out account can wake it, so it moves, with --signed-out for the mover. Not covered: a
+               Claude run straight in a terminal (no job file); one that was idle when the account was signed out (it
+               moves after its next request fails, within about a minute).
+  wakes        rule 8, no leave at all: it hit a limit its own account no longer has and its job is still "blocked",
+               with no turn started for it since. A wake changes no account, so it neither shows "from" nor starts the
+               30-minute gap.
+  only when    between replies, no unsent text, not on the desktop you are looking at, not moved in the last 30
+               minutes (a real hit or a stranded Claude ignores the last two); every move but those two also waits for
+               any background command or agent the Claude started to end; not waiting on you, unless its account is
+               spent: then it moves mid-question, never off your desktop or with an answer you started, and asks the
+               same question again there. A Claude the mover refused is not tried again for 10 minutes, unless it has
+               hit a limit since on an account it must leave.
+  goes to      an eligible account in its week's last 24 hours with 10+ points of room (3+ for a new Claude) first,
+               since that room is lost at the reset; then the eligible account whose week resets soonest. Weeks that
+               reset together: the top urgency x balance x 5h-room / (1 + Claudes working there).
+  never to     an account that is signed out (`status` names the sign): it has no sign-in file, or a job there stopped
+               on "Login expired" since its last good reading and its last /login, or the usage endpoint has answered
+               nothing but HTTP errors for 6 hours. An expired short pass is no such sign: Claude Code renews it on
+               its first request. Nor to an account whose organization has disabled Claude Code for it, nor to one
+               that is not set up (its first run was never finished), nor, for one Claude, to an account that was
+               never told to trust the folder that Claude's conversation runs in, nor to an account paused by hand
+               (a `.claude-paused` file in its folder). No API-key path, ever: the account is simply left out.
+  pulled       onto a week in its last 24 hours with 10+ points of room, an idle Claude from any other account. Same
+               "only when" rules; never off a week that ends within 48 hours while it has room.
+  flags        an account whose sign-in file was wiped (an empty refresh token, an empty access token and expiresAt 0:
+               Claude Code empties it when a refresh is rejected): `st["wiped"]` in the state, and lines in the shared
+               alerts log ($CLAUDE_HUB_SIGNIN_ALERTS, else ~/.local/state/claude-hub/signin-alerts.log; also the
+               service journal) naming the file's time and the Claude processes of the last two 60-second looks. A
+               wiped account is no destination. Each pass also watches every sign-in's end: `st["signin"]` holds
+               {ends, state ok|due|out, out_since} per account (`status` shows it); an account signed out gets a
+               critical notice at once, again every 30 minutes for 2 hours, then every 2 hours, and one "signed in
+               again" notice; one ending within 3 days gets one notice between 08:00 and 22:00 once per local day.
+
+  claude-autoswap run [--once]      the watcher (claude-autoswap.service)
+  claude-autoswap status [--json]   meters, speeds, the recommended account, the last moves
+  claude-autoswap recommend [--model M]  the account a new Claude should start on (empty: none has room);
+                                             a Fable M names one with Fable room
+  claude-autoswap hook              StopFailure hook (stdin = the hook payload): flags a limit hit
+  claude-autoswap install-hook      adds that hook to every account's settings.json (idempotent)
+
+Test switches: CLAUDE_HUB_AUTOSWAP_USAGE_URL, CLAUDE_HUB_AUTOSWAP_STATE, CLAUDE_HUB_AUTOSWAP_HITS,
+CLAUDE_HUB_AUTOSWAP_MOVER, CLAUDE_HUB_AUTOSWAP_NOW, CLAUDE_HUB_AUTOSWAP_LIVE,
+CLAUDE_HUB_AUTOSWAP_NOTIFY (notify-send), CLAUDE_HUB_SIGNIN_ALERTS (the alerts log),
+CLAUDE_HUB_AUTOSWAP_PROC (the /proc a Claude snapshot reads; an in-process test with none reads no process at
+all), plus claude-desks's.
+"""
+from __future__ import annotations
+
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _load_desktop():
+    path = Path(__file__).resolve().parent / "claude-desks"
+    if not path.exists() and shutil.which("claude-desks"):
+        path = Path(shutil.which("claude-desks")).resolve()
+    loader = importlib.machinery.SourceFileLoader("claude_desks", str(path))
+    spec = importlib.util.spec_from_loader("claude_desks", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+DK = _load_desktop()
+
+
+WEEK_LINE = 100.0
+FABLE_LINE = 100.0
+FIVE_HOUR_LINE = 98.0
+HORIZON = 10.0
+REFILL_WAIT = HORIZON
+TARGET_MARGIN = 5.0
+TARGET_FIVE_HOUR = 90.0
+MIN_GAP = 30 * 60
+SLOPE_WINDOW = 10 * 60
+MIN_SPAN = 60
+SAME_READING = 30
+FULL_WEEK_HOURS = 168.0
+PULL_FIVE_HOUR = 75.0
+PULLS_PER_PASS = 3
+PULL_PAUSE = 30 * 60
+EXPIRING_HOURS = 24.0
+KEEP_HOURS = 48.0
+EXPIRING_ROOM = 10.0
+NEW_ROOM = 3.0
+KEEP_ROOM = 1.0
+PULL_LAST = 3600
+BG_HOURS = 12.0
+SPENT_RULES = (1, 2, 4, 5)
+FIVE_HOURS = 5 * 3600
+WEEK_SECONDS = FULL_WEEK_HOURS * 3600
+HIT_SAME_SECONDS = 60
+TURN_START_GRACE = 5 * 60
+
+HOME = Path.home()
+USAGE_URL = os.environ.get("CLAUDE_HUB_AUTOSWAP_USAGE_URL") or "https://api.anthropic.com/api/oauth/usage"
+STATE = Path(os.environ.get("CLAUDE_HUB_AUTOSWAP_STATE") or DK.STATE_HOME / "claude-autoswap.json")
+HITS = Path(os.environ.get("CLAUDE_HUB_AUTOSWAP_HITS") or HOME / ".cache/claude-hub-autoswap")
+LIVE_DIR = Path(os.environ.get("CLAUDE_HUB_AUTOSWAP_LIVE") or HOME / ".cache/claude-hub-account")
+BACKOFF = 300
+HISTORY_KEEP = 15 * 60
+ENDPOINT_EVERY = 300
+STALE_AFTER = 6 * 3600
+SIGNED_OUT = re.compile(r"^\s*login expired\s*$|\bplease run /login\b", re.I)
+ORG_DISABLED = re.compile(r"disabled claude subscription access", re.I)
+ORG_DISABLED_WHY = "disabled by its organization"
+PAUSED_WHY = "paused by him"
+
+
+
+def level(m: dict, key: str, now: float) -> float:
+    v = m.get(key)
+    if v is None:
+        return 0.0
+    r = m.get(key + "_resets")
+    if r is not None and now >= r:
+        return 0.0
+    return float(v)
+
+
+def speed(history: list[list[float]], now: float) -> float:
+    pts = [(float(t), float(v)) for t, v in history if v is not None and now - t <= SLOPE_WINDOW]
+    for i in range(len(pts) - 1, 0, -1):
+        if pts[i][1] < pts[i - 1][1]:
+            pts = pts[i:]
+            break
+    if len(pts) < 2 or pts[-1][0] - pts[0][0] < MIN_SPAN:
+        return 0.0
+    n = len(pts)
+    mt = sum(t for t, _ in pts) / n
+    mv = sum(v for _, v in pts) / n
+    den = sum((t - mt) ** 2 for t, _ in pts)
+    if den == 0:
+        return 0.0
+    slope = sum((t - mt) * (v - mv) for t, v in pts) / den
+    return max(0.0, slope * 60.0)
+
+
+def _num(v) -> float | None:
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return None
+    try:
+        return float(v)
+    except OverflowError:
+        return None
+
+
+def _past_time(v, now: float) -> float | None:
+    v = _num(v)
+    return v if v is not None and math.isfinite(v) and 0 < v <= now else None
+
+
+def last_good(m: dict) -> float:
+    return max(float(m.get("at") or 0), float(m.get("live_at") or 0))
+
+
+def not_a_destination(m: dict | None, now: float, blocked_at: float = 0.0, creds_at: float = 0.0,
+                      onboarded: bool = True, org_blocked_at: float = 0.0, paused: bool = False) -> str:
+    m = m if isinstance(m, dict) else {}
+    err = m.get("error") if isinstance(m.get("error"), str) else ""
+    if err == "no sign-in":
+        return "no sign-in"
+    if not onboarded:
+        return "not set up"
+    good = last_good(m)
+    if blocked_at > good and blocked_at > creds_at:
+        return "signed out"
+    stale = ""
+    if err.startswith("HTTP ") and good:
+        since = _num(m.get("err_since"))
+        if since is None or since > now:
+            since = good
+        quiet = now - max(since, good, creds_at if creds_at <= now else 0.0)
+        if quiet > STALE_AFTER:
+            stale = f"no answer for {int(quiet / 3600)} h"
+    if stale:
+        return stale
+    if org_blocked_at > float(m.get("live_at") or 0):
+        return ORG_DISABLED_WHY
+    if paused:
+        return PAUSED_WHY
+    return ""
+
+
+def account_view(name: str, reading: dict | None, history: list, busy: int, now: float, why_not: str = "") -> dict:
+    m = reading or {}
+    return {"name": name, "ok": bool(m.get("ok")), "fable_known": bool(m.get("fable_known")),
+            "usable": not why_not, "why_not": why_not, "org_disabled": why_not == ORG_DISABLED_WHY,
+            "paused": why_not == PAUSED_WHY, "no_five_hour": bool(m.get("no_five_hour")),
+            "s": level(m, "five_hour", now), "w": level(m, "week", now), "f": level(m, "fable", now),
+            "s_resets": m.get("five_hour_resets"), "w_resets": m.get("week_resets"),
+            "f_resets": m.get("fable_resets"), "r": speed(history or [], now), "n": int(busy or 0)}
+
+
+def eligible(b: dict, model: str, *, destination: bool = True) -> bool:
+    if not b["ok"]:
+        return False
+    if destination and not b.get("usable", True):
+        return False
+    if model == "fable" and not b.get("fable_known"):
+        return False
+    if b["w"] >= WEEK_LINE - TARGET_MARGIN:
+        return False
+    if model == "fable" and b["f"] >= FABLE_LINE - TARGET_MARGIN:
+        return False
+    return b["s"] + b["r"] * HORIZON < TARGET_FIVE_HOUR
+
+
+def hours_left(resets: float | None, now: float) -> float:
+    if not resets:
+        return FULL_WEEK_HOURS
+    return max(0.5, (resets - now) / 3600.0)
+
+
+def next_reset(resets: float | None, now: float) -> float:
+    week = FULL_WEEK_HOURS * 3600
+    if not resets:
+        return now + week
+    if resets <= now:
+        return resets + ((now - resets) // week + 1) * week
+    return float(resets)
+
+
+def losing_room(b: dict, now: float, hours: float, model: str = "other", floor: float = EXPIRING_ROOM,
+                margin: float = TARGET_MARGIN) -> bool:
+    r = b["w_resets"]
+    if not b["ok"] or not r or not now < r <= now + hours * 3600:
+        return False
+    room = WEEK_LINE - margin - b["w"]
+    if model == "fable":
+        room = min(room, FABLE_LINE - margin - b["f"])
+    return room >= floor
+
+
+def expiring(b: dict, now: float, model: str = "other", floor: float = EXPIRING_ROOM) -> bool:
+    return losing_room(b, now, EXPIRING_HOURS, model, floor)
+
+
+def priority(b: dict, model: str, now: float, order: list[str],
+             floor: float = EXPIRING_ROOM) -> tuple:
+    last_day = expiring(b, now, model, floor)
+    return (not last_day, next_reset(b["w_resets"], now),
+            -score(b, model, now), _rank(order, b["name"]))
+
+
+def score(b: dict, model: str, now: float) -> float:
+    if model == "fable":
+        urgency = (FABLE_LINE - b["f"]) / hours_left(b["f_resets"], now)
+        balance = 1 + (b["w"] - b["f"]) / 100
+    else:
+        urgency = (WEEK_LINE - b["w"]) / hours_left(b["w_resets"], now)
+        balance = 1 + (b["f"] - b["w"]) / 100
+    room5 = (100 - b["s"] - b["r"] * HORIZON) / 100
+    return urgency * balance * room5 / (1 + b["n"])
+
+
+def warned(c: dict, a: dict) -> bool:
+    t = c.get("warned_at")
+    return bool(t) and t >= (a.get("s_resets") or 0) - FIVE_HOURS
+
+
+def must_leave(c: dict, a: dict) -> int:
+    if (c.get("hit") or warned(c, a)) and not eligible(a, c["model"], destination=False):
+        return 5
+    if c.get("signed_out") and not a.get("usable", True) and not a.get("org_disabled") and not a.get("paused"):
+        return 7
+    if not a["ok"]:
+        return 0
+    if a["w"] >= WEEK_LINE:
+        return 1
+    if c["model"] == "fable" and a.get("fable_known") and a["f"] >= FABLE_LINE:
+        return 2
+    if a["s"] + a["r"] * HORIZON >= 100:
+        return 3
+    if a["s"] >= FIVE_HOUR_LINE:
+        return 4
+    return 0
+
+
+def limit_windows(c: dict) -> list[tuple[str, int]]:
+    windows = [("s_resets", FIVE_HOURS), ("w_resets", WEEK_SECONDS)]
+    if c.get("model") == "fable":
+        windows.append(("f_resets", WEEK_SECONDS))
+    return windows
+
+
+def hit_window_ends(c: dict, a: dict, kept) -> dict | None:
+    hit_at = _num(c.get("hit_at")) or 0.0
+    if not c.get("hit") or hit_at <= 0:
+        return None
+    if isinstance(kept, dict):
+        was = _num(kept.get("hit_at"))
+        if was is not None and hit_at - was <= HIT_SAME_SECONDS:
+            return {k: kept[k] for k in ("hit_at", "s_resets", "w_resets", "f_resets") if _num(kept.get(k)) is not None}
+    ends = {"hit_at": hit_at}
+    for key, length in limit_windows(c):
+        end = _num(a.get(key))
+        if end is not None and end - length <= hit_at < end:
+            ends[key] = end
+    return ends
+
+
+def reset_after(c: dict, a: dict, since: float, now: float) -> float | None:
+    stored = c.get("hit_ends") if isinstance(c.get("hit_ends"), dict) else {}
+    best = None
+    for key, length in limit_windows(c):
+        moments = []
+        end = _num(a.get(key))
+        if end is not None:
+            moments += [end - length, end]
+        if key == "s_resets" and a.get("no_five_hour"):
+            moments.append(since + FIVE_HOURS)
+        kept = _num(stored.get(key))
+        if kept is not None:
+            moments.append(kept)
+        for moment in moments:
+            if since < moment <= now and (best is None or moment < best):
+                best = moment
+    return best
+
+
+def wakes_in_place(c: dict, a: dict, now: float) -> bool:
+    if not c.get("hit") or c.get("state") != "blocked" or not a.get("usable", True) or c.get("input_after"):
+        return False
+    hit_at = _num(c.get("hit_at")) or 0.0
+    if hit_at > 0 and reset_after(c, a, hit_at, now) is None:
+        return False
+    woke = c.get("woke_at")
+    if not woke:
+        return True
+    return hit_at > woke and now - woke >= RETRY_GAP
+
+
+def refills_first(a: dict, now: float) -> bool:
+    t = a.get("s_resets")
+    return bool(t) and now < t <= now + REFILL_WAIT * 60
+
+
+def refusal(c: dict, rule: int, now: float, last_move: float | None) -> str | None:
+    status = c["status"]
+    asking = status == "waiting" and rule in SPENT_RULES
+    stopped = status == "busy" and c.get("state") == "blocked" and not c.get("input_after") and (
+        (rule in (5, 8) and c.get("hit")) or (rule == 7 and c.get("signed_out")))
+    if status not in ("idle", "shell") and not asking and not stopped:
+        return status or "unknown"
+    if asking and c.get("on_current_desktop"):
+        return "on your desktop"
+    if (rule in (5, 8) and c.get("hit")) or rule == 7:
+        return None
+    if status == "shell" or c.get("background"):
+        return "background work running"
+    if c.get("on_current_desktop"):
+        return "on your desktop"
+    if last_move and now - last_move < MIN_GAP:
+        return "moved recently"
+    return None
+
+
+def _rank(order: list[str], name: str) -> int:
+    return order.index(name) if name in order else len(order)
+
+
+def place(c: dict, views: dict, now: float, order: list[str],
+          exclude=frozenset()) -> tuple[str | None, str | None]:
+    def best(model: str, allow_own: bool) -> str | None:
+        cands = [b for b in views.values()
+                 if (allow_own or b["name"] != c["account"]) and b["name"] not in exclude and eligible(b, model)]
+        if not cands:
+            return None
+        return min(cands, key=lambda b: priority(b, model, now, order))["name"]
+
+    to = best(c["model"], allow_own=False)
+    if to:
+        return to, None
+    if c["model"] == "fable":
+        to = best("other", allow_own=True)
+        if to:
+            return to, "opus"
+    return None, None
+
+
+def waits_until(c: dict, views: dict, now: float) -> float | None:
+    best = None
+    for b in views.values():
+        if not b["ok"]:
+            continue
+        blocking = []
+        if b["w"] >= WEEK_LINE - TARGET_MARGIN:
+            blocking.append(b["w_resets"])
+        if b["s"] + b["r"] * HORIZON >= TARGET_FIVE_HOUR:
+            blocking.append(b["s_resets"])
+        if not blocking or any(t is None for t in blocking):
+            continue
+        t = max(blocking)
+        best = t if best is None else min(best, t)
+    return best
+
+
+def pull_to(c: dict, views: dict, now: float, order: list[str], paused=frozenset()) -> str | None:
+    if c["account"] in views and losing_room(views[c["account"]], now, KEEP_HOURS, c["model"], KEEP_ROOM, 0.0):
+        return None
+    cands = [b for n, b in views.items()
+             if n != c["account"] and n not in paused and n not in c.get("untrusted", ()) and eligible(b, c["model"])
+             and b["s"] + b["r"] * HORIZON < PULL_FIVE_HOUR
+             and expiring(b, now, c["model"]) and b["w_resets"] - now >= PULL_LAST]
+    if not cands:
+        return None
+    return min(cands, key=lambda b: priority(b, c["model"], now, order))["name"]
+
+
+def swap_plan(views: dict, claudes: list[dict], now: float, last_move: dict, order: list[str],
+              pulled=frozenset(), paused=frozenset()) -> tuple[list[dict], dict, dict]:
+    views = {k: dict(v) for k, v in views.items()}
+    moves, waits, held, stay = [], {}, {}, []
+
+    def cut_off(c: dict) -> bool:
+        a = views.get(c["account"]) or {}
+        return bool(c.get("hit") or (c.get("signed_out") and not a.get("usable", True)
+                                     and not a.get("org_disabled") and not a.get("paused")))
+
+    for c in sorted(claudes, key=lambda c: (0 if cut_off(c) else 1, c.get("started") or 0)):
+        a = views.get(c["account"])
+        if a is None:
+            continue
+        rule = must_leave(c, a)
+        if not rule:
+            if not wakes_in_place(c, a, now):
+                stay.append(c)
+                continue
+            why = refusal(c, 8, now, None)
+            if why:
+                held[c["session_id"]] = why
+                continue
+            moves.append({"session_id": c["session_id"], "name": c.get("name", ""), "from": c["account"],
+                          "to": c["account"], "model": None, "rule": 8, "continue": True, "asking": False,
+                          "signed_out": False,
+                          "score": round(score(views[c["account"]], c["model"], now), 4)})
+            if c["status"] != "busy":
+                views[c["account"]]["n"] += 1
+            continue
+        gap_from = None if c["session_id"] in pulled else last_move.get(c["session_id"])
+        why = refusal(c, rule, now, gap_from)
+        if not why and rule in (3, 4) and refills_first(a, now):
+            why = f"5-hour refills {time.strftime('%H:%M', time.localtime(math.ceil(a['s_resets'])))}"
+        if why:
+            held[c["session_id"]] = why
+            continue
+        skip = frozenset(c.get("untrusted", ()))
+        to, model = place(c, views, now, order, exclude=skip)
+        if to is None:
+            if skip and place(c, views, now, order)[0] is not None:
+                held[c["session_id"]] = f"no account with room trusts {c.get('cwd') or 'its folder'}"
+            else:
+                waits[c["session_id"]] = waits_until(c, views, now)
+            continue
+        asking = c["status"] == "waiting"
+        moves.append({"session_id": c["session_id"], "name": c.get("name", ""), "from": c["account"], "to": to,
+                      "model": model, "rule": rule, "continue": rule == 5 and not asking, "asking": asking,
+                      "signed_out": rule == 7,
+                      "score": round(score(views[to], model or c["model"], now), 4)})
+        views[to]["n"] += 1
+    pulls = 0
+    for c in stay:
+        if pulls >= PULLS_PER_PASS:
+            break
+        to = pull_to(c, views, now, order, paused)
+        if not to or refusal(c, 6, now, last_move.get(c["session_id"])):
+            continue
+        moves.append({"session_id": c["session_id"], "name": c.get("name", ""), "from": c["account"], "to": to,
+                      "model": None, "rule": 6, "continue": False, "asking": False,
+                      "score": round(score(views[to], c["model"], now), 4)})
+        views[to]["n"] += 1
+        pulls += 1
+    return moves, waits, held
+
+
+def recommend(views: dict, now: float, order: list[str], model: str = "other") -> str | None:
+    ranked = recommend_order(views, now, order, model)
+    return ranked[0] if ranked else None
+
+
+def recommend_order(views: dict, now: float, order: list[str], model: str = "other") -> list[str]:
+    cands = [b for b in views.values() if eligible(b, model)]
+    return [b["name"] for b in sorted(cands, key=lambda b: priority(b, model, now, order, NEW_ROOM))]
+
+
+def when(t: float) -> str:
+    return time.strftime("%a %b %-d %H:%M", time.localtime(t))
+
+
+def _under_test(var: str) -> bool:
+    return "unittest" in sys.modules and not os.environ.get(var) and Path(sys.argv[0]).name != Path(__file__).name
+
+
+def notify(title: str, body: str, urgency: str = "critical", tag: str | None = None) -> bool | None:
+    if _under_test("CLAUDE_HUB_AUTOSWAP_NOTIFY"):
+        return None
+    cmd = os.environ.get("CLAUDE_HUB_AUTOSWAP_NOTIFY") or shutil.which("notify-send")
+    if not cmd:
+        return None
+    try:
+        stack = ["-h", f"string:x-dunst-stack-tag:{tag}"] if tag else []
+        res = subprocess.run([str(cmd), "-a", "Claude hub", "-u", urgency, "-i", "view-refresh", *stack, title, body],
+                             stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    except Exception:
+        return False
+    return res.returncode == 0
+
+
+def _epoch(iso: str | None) -> float | None:
+    if not iso or not isinstance(iso, str):
+        return None
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except ValueError:
+        return None
+
+
+def parse_usage(body: dict) -> dict | None:
+    limits = body.get("limits") if isinstance(body, dict) else None
+    if not isinstance(limits, list):
+        return None
+    out = {"five_hour": None, "five_hour_resets": None, "week": None, "week_resets": None,
+           "fable": None, "fable_resets": None, "no_five_hour": False}
+    kinds = {l.get("kind") for l in limits if isinstance(l, dict)}
+    for l in limits:
+        if not isinstance(l, dict):
+            continue
+        kind = l.get("kind")
+        model = (((l.get("scope") or {}).get("model") or {}).get("display_name") or "").lower()
+        key = {"session": "five_hour", "weekly_all": "week"}.get(kind)
+        if kind == "weekly_scoped" and model.startswith("fable"):
+            key = "fable"
+        if not key:
+            continue
+        out[key] = float(l["percent"]) if l.get("percent") is not None else None
+        out[key + "_resets"] = _epoch(l.get("resets_at"))
+    for src, key in (("five_hour", "five_hour"), ("seven_day", "week")):
+        u = (body.get(src) or {}).get("utilization") if isinstance(body.get(src), dict) else None
+        if u is not None:
+            out[key] = float(u)
+    week_number = any(isinstance(l, dict) and l.get("kind") == "weekly_all" and _num(l.get("percent")) is not None
+                      for l in limits)
+    out["no_five_hour"] = (week_number and "session" not in kinds and body.get("five_hour") is None)
+    return out
+
+
+def fetch_usage(account: str) -> tuple[dict | None, str, float]:
+    try:
+        oauth = json.loads((DK.ACCTS / account / ".credentials.json").read_text())["claudeAiOauth"]
+        tok = oauth["accessToken"]
+        if not tok:
+            return None, "no sign-in", 0.0
+    except Exception:
+        return None, "no sign-in", 0.0
+    expires = float(oauth.get("expiresAt") or 0) / 1000
+    if expires and expires < time.time():
+        return None, "sign-in expired", 0.0
+    req = urllib.request.Request(USAGE_URL, headers={"Authorization": f"Bearer {tok}",
+                                                     "anthropic-beta": "oauth-2025-04-20"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            parsed = parse_usage(json.loads(r.read()))
+            return (parsed, "", 0.0) if parsed is not None else (None, "unknown answer", 0.0)
+    except urllib.error.HTTPError as e:
+        wait = 0.0
+        if e.code == 429:
+            try:
+                wait = max(BACKOFF, float(e.headers.get("retry-after") or 0))
+            except ValueError:
+                wait = BACKOFF
+        e.close()
+        return None, f"HTTP {e.code}", wait
+    except Exception as e:
+        return None, type(e).__name__, 0.0
+
+
+def read_live(account: str) -> dict | None:
+    p = LIVE_DIR / f"live-{account}.json"
+    try:
+        at = p.stat().st_mtime
+        d = json.loads(p.read_text())
+        five = d.get("five_hour") or {}
+        week = d.get("seven_day") or {}
+        s, w = five.get("used_percentage"), week.get("used_percentage")
+        if s is None and w is None:
+            return None
+        return {"five_hour": float(s) if s is not None else None,
+                "five_hour_resets": float(five["resets_at"]) if five.get("resets_at") is not None else None,
+                "week": float(w) if w is not None else None,
+                "week_resets": float(week["resets_at"]) if week.get("resets_at") is not None else None,
+                "at": at}
+    except Exception:
+        return None
+
+
+def credentials_at(account: str) -> float:
+    try:
+        return (DK.ACCTS / account / ".credentials.json").stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+ALERT_TOOL = "claude-autoswap"
+ALERT_MAX = 3900
+MODE_WORDS = {b"-p": "-p", b"--print": "-p", b"--bg": "--bg", b"agents": "agents", b"stop": "stop",
+              b"attach": "attach", b"daemon": "daemon", b"bg-pty-host": "bg-pty-host",
+              b"--bg-pty-host": "bg-pty-host"}
+SUSPECT_KEEP = 50
+SUSPECT_FOR = 24 * 3600
+PROC_LINES = 60
+WATCH: dict = {}
+
+
+def reset_wipe_watch() -> None:
+    WATCH.clear()
+    WATCH.update(prev=None, prev_at=0.0, cur=[], suspects={}, good_at={})
+
+
+reset_wipe_watch()
+
+
+def wiped(account: str) -> str:
+    try:
+        data = json.loads((DK.ACCTS / account / ".credentials.json").read_text())
+    except Exception:
+        return "unknown"
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        return "unknown"
+    blank = lambda v: v is None or v == "" or v == 0
+    refresh = oauth.get("refreshToken")
+    if isinstance(refresh, str) and refresh:
+        return "live"
+    if blank(refresh) and blank(oauth.get("accessToken")) and blank(oauth.get("expiresAt")):
+        return "wiped"
+    return "unknown"
+
+
+def signin_alerts_path() -> Path:
+    return Path(os.environ.get("CLAUDE_HUB_SIGNIN_ALERTS") or HOME / ".local/state/claude-hub/signin-alerts.log")
+
+
+def _plain(text) -> str:
+    return re.sub(r"[^\x20-\x7e]", "?", str(text))
+
+
+def _utc(t) -> str:
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(t)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _tilde(path) -> str:
+    s = str(path)
+    home = str(HOME)
+    return ("~" + s[len(home):] if s == home or s.startswith(home + "/") else s)[:300]
+
+
+def log_alert(message: str, now: float) -> bool:
+    if _under_test("CLAUDE_HUB_SIGNIN_ALERTS"):
+        return False
+    text = _plain(message)
+    try:
+        print(f"{ALERT_TOOL}: {text}", file=sys.stderr)
+    except Exception:
+        pass
+    data = f"{_utc(now)} {ALERT_TOOL}: {text}"[:ALERT_MAX].encode("ascii") + b"\n"
+    try:
+        path = signin_alerts_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        return True
+    except Exception:
+        return False
+
+
+def _folder(raw: bytes | None, default: Path | None = None) -> str | None:
+    try:
+        if not raw:
+            return str(default.resolve()) if default is not None else None
+        s = os.fsdecode(raw)
+        p = Path(s).expanduser() if s.startswith("~") else Path(s)
+        return str(p.resolve()) if p.is_absolute() else s
+    except Exception:
+        return os.fsdecode(raw) if raw else None
+
+
+def claude_snapshot(proc_root: Path | None = None) -> list[dict]:
+    if proc_root is None:
+        named = os.environ.get("CLAUDE_HUB_AUTOSWAP_PROC")
+        if named:
+            proc_root = Path(named)
+        elif _under_test("CLAUDE_HUB_AUTOSWAP_PROC"):
+            return []
+        else:
+            proc_root = Path("/proc")
+    versions = str(HOME / ".local/share/claude/versions") + "/"
+    try:
+        uid, hz, boot = os.getuid(), os.sysconf("SC_CLK_TCK"), DK.boot_epoch()
+        entries = [p for p in proc_root.iterdir() if p.name.isascii() and p.name.isdigit()]
+    except (OSError, ValueError):
+        return []
+    out = []
+    for p in entries:
+        try:
+            if p.stat().st_uid != uid:
+                continue
+            try:
+                exe = os.readlink(p / "exe")
+            except OSError:
+                exe = ""
+            with open(p / "cmdline", "rb") as fh:
+                argv = fh.read(1 << 16).split(b"\0")
+            if not exe.startswith(versions) and os.path.basename(argv[0]) != b"claude":
+                continue
+            with open(p / "environ", "rb") as fh:
+                env = fh.read(DK.READ_MAX).split(b"\0")
+        except (OSError, ValueError):
+            continue
+        config = storage = None
+        for item in env:
+            if item.startswith(b"CLAUDE_CONFIG_DIR="):
+                config = item[len(b"CLAUDE_CONFIG_DIR="):]
+            elif item.startswith(b"CLAUDE_SECURESTORAGE_CONFIG_DIR="):
+                storage = item[len(b"CLAUDE_SECURESTORAGE_CONFIG_DIR="):]
+        start = None
+        try:
+            ticks = DK.stat_start_ticks((p / "stat").read_bytes().decode("utf-8", "replace"))
+            if ticks is not None and boot > 0 and hz > 0:
+                start = boot + ticks / hz
+        except (OSError, ValueError):
+            pass
+        mode = next((MODE_WORDS[t] for t in argv[1:] if t in MODE_WORDS), "interactive")
+        out.append({"pid": int(p.name), "start": start, "mode": mode,
+                    "config": _folder(config, HOME / ".claude"), "storage": _folder(storage)})
+    return out
+
+
+def note_suspects(snap: list[dict], account_dirs: set, now: float) -> None:
+    sus = WATCH["suspects"]
+    for p in snap:
+        if p["storage"] is None and p["config"] not in account_dirs:
+            rec = sus.get((p["pid"], p["start"]))
+            if rec:
+                rec["last"] = now
+            else:
+                sus[(p["pid"], p["start"])] = {**p, "first": now, "last": now}
+    for key in [k for k, v in sus.items() if now - v["last"] > SUSPECT_FOR]:
+        del sus[key]
+    for key in sorted(sus, key=lambda k: sus[k]["last"])[:max(0, len(sus) - SUSPECT_KEEP)]:
+        del sus[key]
+
+
+def _proc_line(p: dict, account_dir: str | None) -> str:
+    mark = " [this account's folder]" if account_dir and account_dir in (p.get("config"), p.get("storage")) else ""
+    storage = _tilde(p["storage"]) if p.get("storage") else "-"
+    return (f"pid {p.get('pid')} started {_utc(p.get('start'))} {p.get('mode')} "
+            f"config={_tilde(p.get('config'))} storage={storage}{mark}")
+
+
+def emptied_note(account: str, seen: float, hm) -> str:
+    written = credentials_at(account)
+    return f", file emptied {hm(written)}" if 0 < written < seen - METERS_EVERY else ""
+
+
+def stated_wiped(st: dict) -> dict[str, float]:
+    raw = st.get("wiped")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for n, t in raw.items():
+        v = _num(t)
+        if isinstance(n, str) and v is not None and math.isfinite(v) and abs(v) < 1e11:
+            out[n] = v
+    return out
+
+
+def wipe_alert(account: str, written: float, now: float, first: bool, account_dir: str | None,
+               older: bool = False) -> None:
+    if first:
+        log_alert(f"{account}: sign-in found wiped at watcher start, file last written {_utc(written)}; no refresh "
+                  f"token, no access token; the Claudes of that time are not known", now)
+    elif older:
+        log_alert(f"{account}: sign-in found wiped, file last written {_utc(written)}, before the look at "
+                  f"{_utc(WATCH['prev_at'])}; no refresh token, no access token; the Claudes of that time are not "
+                  f"known", now)
+    else:
+        prev, cur = WATCH["prev"] or [], WATCH["cur"]
+        log_alert(f"{account}: sign-in wiped, file written {_utc(written)} (when it was emptied); no refresh token, "
+                  f"no access token; below: suspects, then the Claudes of the look at {_utc(WATCH['prev_at'])} and "
+                  f"of this one", now)
+        good = WATCH["good_at"].get(account)
+        sus = sorted((s for s in WATCH["suspects"].values() if good is None or s["last"] >= good),
+                     key=lambda s: s["first"])
+        for label, rows, tail in (("suspect (scratch config folder, no storage folder)", sus, True),
+                                  (f"before ({_utc(WATCH['prev_at'])})", prev, False),
+                                  (f"now ({_utc(now)})", cur, False)):
+            for s in rows[:PROC_LINES]:
+                seen = f" first seen {_utc(s['first'])}, last seen {_utc(s['last'])}" if tail else ""
+                log_alert(f"{account}: {label} {_proc_line(s, account_dir)}{seen}", now)
+            if len(rows) > PROC_LINES:
+                log_alert(f"{account}: {label} and {len(rows) - PROC_LINES} more not listed", now)
+            if not rows:
+                log_alert(f"{account}: {label} none", now)
+
+
+def wipe_watch(st: dict, names: list[str], now: float) -> None:
+    seen = stated_wiped(st)
+    st["wiped"] = {n: t for n, t in seen.items() if n in names}
+    entries = st["wiped"]
+    snap = claude_snapshot()
+    WATCH["cur"] = snap
+    first = WATCH["prev"] is None
+    try:
+        account_dirs = {}
+        for n in names:
+            try:
+                account_dirs[n] = str((DK.ACCTS / n).resolve())
+            except Exception:
+                pass
+        note_suspects(snap, set(account_dirs.values()), now)
+        for n in names:
+            if DK.paused(n):
+                continue
+            state, written = wiped(n), credentials_at(n)
+            if state == "live":
+                WATCH["good_at"][n] = written
+                if n in entries:
+                    del entries[n]
+                    log_alert(f"{n}: signed in again, file written {_utc(written)}", now)
+            elif state == "wiped" and n not in entries:
+                entries[n] = now
+                wipe_alert(n, written, now, first, account_dirs.get(n),
+                           older=written < WATCH["prev_at"] - METERS_EVERY)
+    finally:
+        WATCH["prev"], WATCH["prev_at"] = snap, now
+
+
+SIGNIN_DUE_AHEAD = 3 * 86400
+SIGNIN_OUT_FAST = 30 * 60
+SIGNIN_OUT_SLOW = 2 * 3600
+SIGNIN_DUE_URGENT = 24 * 3600
+SIGNIN_DUE_HOURS = (8, 22)
+SIGNIN_RETRY = 5 * 60
+SIGNIN_UNKNOWN_FOR = 5 * 60
+
+
+def signin_ends(account: str) -> float | None:
+    try:
+        data = json.loads((DK.ACCTS / account / ".credentials.json").read_text())
+        v = data["claudeAiOauth"]["refreshTokenExpiresAt"]
+    except Exception:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 1.6e12 <= v < 1e14:
+        return None
+    return v / 1000.0
+
+
+def signin_same_day(a: float, b: float) -> bool:
+    ta, tb = time.localtime(a), time.localtime(b)
+    return (ta.tm_year, ta.tm_yday) == (tb.tm_year, tb.tm_yday)
+
+
+def signin_clock(t: float, now: float, always_day: bool = False) -> str:
+    a, b = time.localtime(t), time.localtime(now)
+    if not always_day and (a.tm_year, a.tm_yday) == (b.tm_year, b.tm_yday):
+        return time.strftime("%H:%M", a)
+    return time.strftime("%a %m-%d %H:%M", a)
+
+
+def stated_signin(st: dict) -> dict:
+    raw = st.get("signin")
+    out = {}
+    for n, e in (raw.items() if isinstance(raw, dict) else ()):
+        if isinstance(n, str) and isinstance(e, dict) and e.get("state") in ("ok", "due", "out"):
+            since = _num(e.get("out_since"))
+            out[n] = {"ends": e["ends"] if isinstance(e.get("ends"), str) else None, "state": e["state"],
+                      "out_since": since if since is not None and math.isfinite(since) and abs(since) < 1e11
+                      else None}
+    return out
+
+
+def iso_epoch(text) -> float | None:
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def signin_watch(st: dict, names: list[str], now: float, tell=None) -> None:
+    tell = tell or notify
+    prior, wiped_at = stated_signin(st), stated_wiped(st)
+    raw_told, raw_unknown = st.get("signin_told"), st.get("signin_unknown")
+    told, unknown = {}, {}
+
+    def past(v):
+        return _past_time(v, now)
+
+    for n, e in (raw_told.items() if isinstance(raw_told, dict) else ()):
+        last = past(e.get("last")) if isinstance(e, dict) else None
+        fail = past(e.get("fail_at")) if isinstance(e, dict) else None
+        if n in names and (last is not None or fail is not None) and e.get("state") in ("out", "due"):
+            told[n] = {"state": e["state"], "last": last, "n": e["n"] if isinstance(e.get("n"), int) else 1}
+            if fail is not None:
+                told[n]["fail_at"] = fail
+    for n, t in (raw_unknown.items() if isinstance(raw_unknown, dict) else ()):
+        t = past(t)
+        if n in names and t is not None and t >= 1.6e9:
+            unknown[n] = t
+    signin = {}
+
+    def say(n, title, body, urgency):
+        try:
+            return tell(title, body, urgency=urgency, tag=f"claude-account-alert-{n}")
+        except Exception:
+            return False
+
+    def send(n, e, state, title, body, urgency, every):
+        mine = e if e and e["state"] == state else None
+        if e and e.get("fail_at") is not None and now - e["fail_at"] < SIGNIN_RETRY:
+            return
+        if mine and mine["last"] is not None:
+            if every is None:
+                if signin_same_day(mine["last"], now):
+                    return
+            elif now - mine["last"] < every:
+                return
+        if say(n, title, body, urgency) is True:
+            told[n] = {"state": state, "last": now, "n": (mine["n"] if mine else 0) + 1}
+        else:
+            told[n] = {**(mine or {"state": state, "last": None, "n": 0}), "fail_at": now}
+
+    for n in names:
+        if DK.paused(n):
+            unknown.pop(n, None)
+            continue
+        file_state = wiped(n)
+        before = prior.get(n)
+        held_out = bool(before) and before["state"] == "out"
+        if file_state == "unknown":
+            if now - unknown.setdefault(n, now) < SIGNIN_UNKNOWN_FOR and not held_out:
+                continue
+        else:
+            unknown.pop(n, None)
+        ends = signin_ends(n)
+        passed = ends is not None and ends <= now
+        if file_state in ("wiped", "unknown") or passed:
+            state = "out"
+        elif ends is not None and ends - now <= SIGNIN_DUE_AHEAD:
+            state = "due"
+        else:
+            state = "ok"
+        since = None
+        if state == "out":
+            since = before["out_since"] if held_out and before["out_since"] else None
+            since = since or (wiped_at.get(n) if file_state == "wiped" else None) or (ends if passed else None) or now
+        ends_text = _utc(ends) if ends is not None else (before["ends"] if held_out and file_state == "unknown" else None)
+        signin[n] = {"ends": ends_text, "state": state, "out_since": since}
+        e = told.get(n)
+        if state == "out":
+            slow = bool(e) and e["state"] == "out" and e["last"] is not None and e["last"] - since >= 7200
+            if file_state == "live":
+                body = f"{n}'s sign-in ran out at {signin_clock(since, now)}. Its Claudes will stop soon."
+            else:
+                body = f"No Claude can use {n} since {signin_clock(since, now)}."
+            send(n, e, "out", f"Claude account signed out: {n}", body, "critical",
+                 SIGNIN_OUT_SLOW if slow else SIGNIN_OUT_FAST)
+        elif e and e["state"] == "out":
+            if e["last"] is None:
+                del told[n]
+            elif e.get("fail_at") is None or now - e["fail_at"] >= SIGNIN_RETRY:
+                if say(n, f"Claude account signed in again: {n}", f"{n} is signed in again.", "normal") is True:
+                    del told[n]
+                else:
+                    e["fail_at"] = now
+        elif state == "due":
+            if SIGNIN_DUE_HOURS[0] <= time.localtime(now).tm_hour < SIGNIN_DUE_HOURS[1]:
+                urgency = "critical" if ends - now <= SIGNIN_DUE_URGENT else "normal"
+                send(n, e, "due", f"Claude sign-in ends soon: {n}",
+                     f"{n}'s sign-in runs out {signin_clock(ends, now, True)}. After that no Claude can use it.",
+                     urgency, None)
+        elif e:
+            del told[n]
+    st["signin"], st["signin_told"], st["signin_unknown"] = signin, told, unknown
+
+
+def onboarded(account: str) -> bool:
+    try:
+        text = (DK.ACCTS / account / ".claude.json").read_text()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    try:
+        data = json.loads(text)
+    except Exception:
+        return True
+    return not isinstance(data, dict) or data.get("hasCompletedOnboarding") is True
+
+
+def login_block_at(account: str) -> float:
+    newest = 0.0
+    try:
+        files = list((DK.ACCTS / account / "jobs").glob("*/state.json"))
+    except Exception:
+        return 0.0
+    for path in files:
+        try:
+            job = json.loads(path.read_text())
+            if not isinstance(job, dict) or job.get("state") != "blocked":
+                continue
+            detail, at = job.get("detail"), _epoch(job.get("updatedAt"))
+            if isinstance(detail, str) and at and SIGNED_OUT.search(detail):
+                newest = max(newest, at)
+        except Exception:
+            continue
+    return newest
+
+
+def org_block_at(account: str) -> float:
+    newest = 0.0
+    try:
+        files = list((DK.ACCTS / account / "jobs").glob("*/state.json"))
+    except Exception:
+        return 0.0
+    for path in files:
+        try:
+            job = json.loads(path.read_text())
+            if not isinstance(job, dict) or job.get("state") != "blocked":
+                continue
+            detail, at = job.get("detail"), _epoch(job.get("updatedAt"))
+            if isinstance(detail, str) and at and ORG_DISABLED.search(detail):
+                newest = max(newest, at)
+        except Exception:
+            continue
+    return newest
+
+
+def add_point(h: list[list[float]], t: float, value: float) -> None:
+    if h and t - h[-1][0] < SAME_READING:
+        if t >= h[-1][0]:
+            h[-1] = [t, value]
+        return
+    if not h or t > h[-1][0]:
+        h.append([t, value])
+
+
+def note_error(m: dict, err: str, now: float) -> None:
+    was = m.get("error") if isinstance(m.get("error"), str) else ""
+    m["error"] = err
+    if not err.startswith("HTTP "):
+        return
+    good = last_good(m)
+    since = _num(m.get("err_since"))
+    if since is None or since > now:
+        since = good if (good and was.startswith("HTTP ")) else now
+    elif since < good:
+        since = now
+    m["err_since"] = since
+
+
+def refresh_meters(st: dict, names: list[str], now: float) -> None:
+    meters, history = st.setdefault("meters", {}), st.setdefault("history", {})
+    for name in names:
+        m = meters.setdefault(name, {"ok": False})
+        if (_num(m.get("err_since")) or 0.0) > now:
+            m.pop("err_since")
+        live = read_live(name)
+        live_five = False
+        if live is not None and live["at"] > float(m.get("live_at") or 0):
+            m["live_at"] = live["at"]
+            m["ok"] = True
+            flagged = bool(m.get("no_five_hour"))
+            if live["at"] >= float(m.get("at") or 0):
+                if live["five_hour"] is not None and not flagged:
+                    m["five_hour"], m["five_hour_resets"] = live["five_hour"], live["five_hour_resets"]
+                    live_five = True
+                if live["week"] is not None:
+                    m["week"], m["week_resets"] = live["week"], live["week_resets"]
+            h = [p for p in history.get(name, []) if now - p[0] <= HISTORY_KEEP]
+            if live["five_hour"] is not None and not flagged:
+                add_point(h, live["at"], live["five_hour"])
+            history[name] = h
+        asked = float(m.get("asked") or 0)
+        new_sign_in = asked < credentials_at(name) <= now
+        if now - asked < ENDPOINT_EVERY or (now < float(m.get("backoff_until") or 0) and not new_sign_in):
+            continue
+        parsed, err, wait = fetch_usage(name)
+        m["asked"] = now
+        if parsed is None:
+            note_error(m, err, now)
+            if wait:
+                m["backoff_until"] = now + wait
+            continue
+        m.update(ok=True, at=now, error="", backoff_until=0)
+        m.pop("err_since", None)
+        if parsed["fable"] is not None:
+            m["fable"], m["fable_resets"], m["fable_known"] = parsed["fable"], parsed["fable_resets"], True
+        if parsed.get("no_five_hour"):
+            m["no_five_hour"], m["five_hour"], m["five_hour_resets"] = True, 0.0, None
+            history[name] = []
+        elif parsed["five_hour"] is not None:
+            m.pop("no_five_hour", None)
+        newer = now < float(m.get("live_at") or 0)
+        h = [p for p in history.get(name, []) if now - p[0] <= HISTORY_KEEP]
+        if parsed["five_hour"] is not None and not (newer and live_five):
+            m["five_hour"], m["five_hour_resets"] = parsed["five_hour"], parsed["five_hour_resets"]
+            add_point(h, now, parsed["five_hour"])
+        if parsed["week"] is not None and not newer:
+            m["week"], m["week_resets"] = parsed["week"], parsed["week_resets"]
+        history[name] = h
+
+
+def read_state() -> dict:
+    try:
+        st = json.loads(STATE.read_text())
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_state(st: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_name(f".{STATE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(st, indent=1))
+    os.replace(tmp, STATE)
+
+
+MOVER = os.environ.get("CLAUDE_HUB_AUTOSWAP_MOVER") or str(Path(__file__).resolve().parent / "claude-move")
+MOVER_BUDGET = 170
+MOVER_LIMIT = MOVER_BUDGET + 55 + 10
+METERS_EVERY = 60
+HITS_EVERY = 5
+RETRY_GAP = 10 * 60
+FROM_SHOWN = 2 * 3600
+KEEP_MOVES = 50
+
+
+def now_() -> float:
+    return float(os.environ.get("CLAUDE_HUB_AUTOSWAP_NOW") or time.time())
+
+
+def usage_warning(lines: list[str]) -> float | None:
+    for line in reversed(lines):
+        if '"usageLimitNote"' not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict) or not r.get("usageLimitNote"):
+            continue
+        return _epoch(r.get("timestamp")) if r["usageLimitNote"] == "wrap_up" else None
+    return None
+
+
+def newest_transcript(account: str, sid: str) -> Path | None:
+    best = None
+    for path in sorted((DK.ACCTS / account / "projects").glob(f"*/{sid}.jsonl")):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if best is None or (st.st_mtime, st.st_size) > best[0]:
+            best = ((st.st_mtime, st.st_size), path)
+    return best[1] if best else None
+
+
+def conversation_cwd(path: Path, lines: list[str]) -> str:
+    folder = path.parent.name
+    for line in reversed(lines):
+        if '"cwd"' not in line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        c = r.get("cwd") if isinstance(r, dict) else None
+        if isinstance(c, str) and os.path.isabs(c) and re.sub(r"[^A-Za-z0-9]", "-", c) == folder and os.path.isdir(c):
+            return c
+    return ""
+
+
+LOCAL_COMMAND_MARKS = ("<local-command-", "<command-")
+_SET_MODEL = re.compile(r"\s*<local-command-stdout>\s*Set model to\s+`?(?:claude-)?(?:(fable|opus|sonnet|haiku)\b)?",
+                        re.IGNORECASE)
+_FABLE_HIT = "hit your Fable limit"
+
+
+def chosen_model(r) -> str:
+    if not isinstance(r, dict) or not isinstance(r.get("message"), dict):
+        return ""
+    content = r["message"].get("content")
+    if r.get("type") == "user" and isinstance(content, str):
+        m = _SET_MODEL.match(content)
+        return (m.group(1) or "other").lower() if m else ""
+    if r.get("type") == "assistant" and r["message"].get("model") == "<synthetic>" and isinstance(content, list):
+        text = " ".join(p.get("text") or "" for p in content if isinstance(p, dict))
+        return "fable" if _FABLE_HIT in text else ""
+    return ""
+
+
+
+def starts_turn(r) -> bool:
+    if not isinstance(r, dict):
+        return False
+    typ = r.get("type")
+    if typ == "queue-operation":
+        return r.get("operation") == "dequeue"
+    if typ == "attachment":
+        return isinstance(r.get("attachment"), dict) and r["attachment"].get("type") == "queued_command"
+    if typ != "user" or r.get("isMeta"):
+        return False
+    content = r["message"].get("content") if isinstance(r.get("message"), dict) else None
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        content = content[0].get("text")
+    return not (isinstance(content, str) and content.lstrip().startswith(LOCAL_COMMAND_MARKS))
+
+
+def turn_started(input_at, now: float) -> bool:
+    return input_at is not None and now - input_at < TURN_START_GRACE
+
+
+def transcript_facts(account: str, sid: str) -> dict:
+    path = newest_transcript(account, sid)
+    out = {"model": "other", "model_id": "", "tokens": 0, "hit": False, "hit_at": None, "signed_out": False,
+           "warned_at": None, "cwd": "", "input_at": None}
+    if path is None:
+        return out
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - (1 << 20)))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return out
+    out["warned_at"] = usage_warning(lines)
+    out["cwd"] = conversation_cwd(path, lines)
+    last_assistant_seen, chosen = False, ""
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        chosen = chosen or chosen_model(r)
+        if r.get("type") != "assistant":
+            if not last_assistant_seen and starts_turn(r):
+                at = _epoch(r.get("timestamp"))
+                at = math.inf if at is None else at
+                out["input_at"] = at if out["input_at"] is None else max(out["input_at"], at)
+            continue
+        m = r.get("message") or {}
+        if not last_assistant_seen:
+            last_assistant_seen = True
+            out["hit"] = r.get("error") == "rate_limit"
+            out["hit_at"] = _epoch(r.get("timestamp")) if out["hit"] else None
+            out["signed_out"] = r.get("error") == "authentication_failed"
+        if m.get("model") and m["model"] != "<synthetic>":
+            out["model_id"] = m["model"] if not chosen or chosen in m["model"] else chosen.replace("other", "")
+            out["model"] = "fable" if "fable" in out["model_id"] else "other"
+            u = m.get("usage") or {}
+            out["tokens"] = sum(int(u.get(k) or 0) for k in
+                                ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+            break
+    else:
+        if chosen:
+            out["model_id"], out["model"] = chosen.replace("other", ""), "fable" if chosen == "fable" else "other"
+    return out
+
+
+_NOTICE = re.compile(r"\s*<task-notification>\s*<task-id>([^<\s]+)</task-id>")
+_TASK_MARKS = ('"backgroundTaskId"', '"isAsync"', '"taskType"', '"resumedAgentId"', '"task_id"', '"queue-operation"',
+               '"queued_command"', "<task-notification>")
+
+
+def task_event(r: dict) -> tuple[str, str] | None:
+    typ, notice = r.get("type"), ""
+    if typ == "queue-operation":
+        notice = r.get("content")
+    elif typ == "attachment" and isinstance(r.get("attachment"), dict) \
+            and r["attachment"].get("type") == "queued_command":
+        notice = r["attachment"].get("prompt")
+    elif typ == "user" and isinstance(r.get("message"), dict):
+        notice = r["message"].get("content")
+    m = _NOTICE.match(notice) if isinstance(notice, str) else None
+    if m:
+        return "end", m.group(1)
+    res = r.get("toolUseResult")
+    if not isinstance(res, dict):
+        return None
+    if res.get("task_id") and "stopped" in str(res.get("message") or "").lower():
+        return "end", str(res["task_id"])
+    task = (res.get("backgroundTaskId") or (res.get("agentId") if res.get("isAsync") else None)
+            or (res.get("taskId") if res.get("taskType") == "local_workflow" else None) or res.get("resumedAgentId"))
+    return ("start", str(task)) if task else None
+
+
+def scan_tasks(lines, live: dict[str, float]) -> dict[str, float]:
+    for line in lines:
+        if not any(k in line for k in _TASK_MARKS):
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        ev = task_event(r)
+        if not ev:
+            continue
+        if ev[0] == "end":
+            live.pop(ev[1], None)
+        else:
+            at = _epoch(r.get("timestamp"))
+            if at is not None:
+                live[ev[1]] = at
+    return live
+
+
+def pending_tasks(text: str, since: float) -> set[str]:
+    return {t for t, at in scan_tasks(text.splitlines(), {}).items() if at >= since}
+
+
+_BG_SEEN: dict[str, tuple[int, dict[str, float]]] = {}
+
+
+def background_work(account: str, sid: str, since: float) -> int:
+    try:
+        path = newest_transcript(account, sid)
+        if path is None:
+            return 0
+        size = path.stat().st_size
+        offset, live = _BG_SEEN.get(str(path), (0, {}))
+        if size < offset:
+            offset, live = 0, {}
+        if size > offset:
+            with path.open("rb") as f:
+                f.seek(offset)
+                chunk = f.read(size - offset)
+            whole = chunk.rfind(b"\n") + 1
+            live = scan_tasks(chunk[:whole].decode("utf-8", "replace").splitlines(), dict(live))
+            offset += whole
+        _BG_SEEN[str(path)] = (offset, live)
+        return sum(1 for at in live.values() if at >= since)
+    except Exception:
+        return 0
+
+
+def on_hidden_screen(konsole_pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{konsole_pid}/environ").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return True
+    env = dict(kv.split(b"=", 1) for kv in raw.split(b"\0") if b"=" in kv)
+    return env.get(b"DISPLAY", b"").decode().split(".")[0] == DK.HIDDEN
+
+
+def flag_at(sid: str) -> float:
+    path = HITS / f"{sid}.json"
+    try:
+        at = float(json.loads(path.read_text())["at"])
+        if math.isfinite(at):
+            return at
+    except Exception:
+        pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def hit_since_refusal(c: dict, refused_at) -> bool:
+    return bool(refused_at and c.get("hit") and (c.get("hit_at") or 0) > float(refused_at))
+
+
+def claudes_now(snap, hits: set[str], now: float, keys: dict | None = None) -> list[dict]:
+    mem = str(Path.home() / ".claude-mem")
+    by_sid = {e.get("session_id"): e for e in snap.registry if e.get("session_id")}
+    out = []
+    for s in snap.sessions:
+        sid = s.get("session_id")
+        if not sid or str(s.get("cwd") or "").startswith(mem):
+            continue
+        if s.get("konsole_pid") and on_hidden_screen(s["konsole_pid"]):
+            continue
+        t = transcript_facts(s["account"], sid)
+        e = by_sid.get(sid)
+        if e is not None:
+            on_current_desktop = bool(snap.current and e.get("desktop_id") == snap.current)
+        else:
+            on_current_desktop = bool(s.get("konsole_pid"))
+        since = work_since(s.get("started"), now)
+        warned_at = t["warned_at"] if t["warned_at"] and t["warned_at"] >= max(since, now - FIVE_HOURS) else None
+        hit = sid in hits or (s.get("state") == "blocked" and t["hit"])
+        cwd = t.get("cwd") or ""
+        untrusted = sorted(a for a, k in (keys or {}).items()
+                           if cwd and k is not None and a != s["account"] and not DK.trusted_in(k, cwd))
+        out.append({"session_id": sid, "name": s.get("name") or "", "account": s["account"],
+                    "status": s.get("status") or "", "state": s.get("state") or "", "kind": s["kind"],
+                    "model": t["model"], "model_id": t["model_id"], "tokens": t["tokens"],
+                    "cwd": cwd, "untrusted": untrusted,
+                    "hit": hit,
+                    "hit_at": max(flag_at(sid) if sid in hits else 0.0, t["hit_at"] or 0.0) if hit else 0.0,
+                    "signed_out": s.get("state") == "blocked" and t["signed_out"],
+                    "input_after": turn_started(t.get("input_at"), now),
+                    "warned_at": warned_at,
+                    "on_current_desktop": on_current_desktop,
+                    "started": s.get("started") or 0,
+                    "background": background_work(s["account"], sid, since)
+                    if s.get("status") in ("idle", "waiting") else 0})
+    return out
+
+
+def work_since(started, now: float) -> float:
+    try:
+        t = float(started or 0)
+    except (TypeError, ValueError):
+        t = 0.0
+    t = t / 1000 if t > 1e11 else t
+    return t - 60 if t > 0 else now - BG_HOURS * 3600
+
+
+def run_mover(mv: dict) -> dict:
+    args = [MOVER, mv["session_id"], mv["to"]]
+    if mv["model"]:
+        args += ["--model", mv["model"]]
+    if mv.get("asking"):
+        args.append("--asking")
+    elif mv["continue"]:
+        args.append("--continue")
+    if mv.get("signed_out"):
+        args.append("--signed-out")
+    args.append("--json")
+    try:
+        res = subprocess.run(args, capture_output=True, text=True, timeout=MOVER_LIMIT)
+        return json.loads(res.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        return {"result": "failed", "reason": f"mover: {type(e).__name__}"}
+
+
+def remembered_blocks(st: dict, now: float, key: str = "login_blocks") -> dict[str, float]:
+    kept = st.get(key)
+    out = {}
+    for name, at in (kept.items() if isinstance(kept, dict) else ()):
+        try:
+            t = _num(at)
+        except OverflowError:
+            continue
+        if t is not None and math.isfinite(t) and t <= now:
+            out[name] = t
+    return out
+
+
+def not_destinations(st: dict, names: list[str], now: float) -> dict[str, str]:
+    meters = st.get("meters") if isinstance(st.get("meters"), dict) else {}
+    kept, kept_org = remembered_blocks(st, now), remembered_blocks(st, now, "org_blocks")
+    why, blocks, org_blocks = {}, {}, {}
+    for name in names:
+        m = meters.get(name)
+        creds_at = credentials_at(name)
+        blocked_at = max(login_block_at(name), kept.get(name, 0.0))
+        org_at = max(org_block_at(name), kept_org.get(name, 0.0))
+        reason = not_a_destination(m, now, blocked_at, creds_at, onboarded(name), org_at, DK.paused(name))
+        if reason:
+            why[name] = reason
+        if blocked_at > 0 and blocked_at > max(last_good(m if isinstance(m, dict) else {}), creds_at):
+            blocks[name] = min(blocked_at, now)
+        if org_at > 0 and org_at > (_num((m if isinstance(m, dict) else {}).get("live_at")) or 0.0):
+            org_blocks[name] = min(org_at, now)
+    st["login_blocks"] = blocks
+    st["org_blocks"] = org_blocks
+    return why
+
+
+def cycle(st: dict, now: float, fetch: bool) -> dict:
+    names = DK.accounts()
+    order = list(names)
+    if fetch:
+        refresh_meters(st, names, now)
+    hits = {p.stem for p in HITS.glob("*.json")} if HITS.is_dir() else set()
+    sweep = DK.sweep_agents(names, shared=True)
+    busy = {n: sum(1 for r in (sweep.get(n) or []) if isinstance(r, dict) and r.get("status") == "busy")
+            for n in names}
+    history = st.setdefault("history", {})
+    st["not_destination"] = not_destinations(st, names, now)
+    views = {n: account_view(n, st.get("meters", {}).get(n), history.get(n, []), busy[n], now,
+                             st["not_destination"].get(n, "")) for n in names}
+    st["speeds"] = {n: round(v["r"], 3) for n, v in views.items()}
+    snap = DK.gather(sweep)
+    claudes = claudes_now(snap, hits, now, {n: DK.trust_keys(n) for n in names})
+    last_move, last_try = st.setdefault("last_move", {}), st.setdefault("last_try", {})
+    refused_at = st.setdefault("refused_at", {})
+    early_at = st.setdefault("early_at", {})
+    seen = {c["session_id"]: c for c in claudes}
+    waited = {sid for sid in seen if now - float(last_try.get(sid) or 0) >= RETRY_GAP}
+    early = {sid for sid, c in seen.items() if sid not in waited and hit_since_refusal(c, refused_at.get(sid))
+             and c["account"] in views and must_leave(c, views[c["account"]]) == 5}
+    retry_ok = [c for c in claudes if c["session_id"] in waited | early]
+    pulled, pause = st.setdefault("pulled", {}), st.setdefault("pull_pause", {})
+    info = st.setdefault("claudes", {})
+    for c in claudes:
+        c["woke_at"] = _num((info.get(c["session_id"]) or {}).get("woke_at"))
+        c["hit_ends"] = hit_window_ends(c, views.get(c["account"]) or {},
+                                        (info.get(c["session_id"]) or {}).get("hit_ends"))
+        was = (info.get(c["session_id"]) or {}).get("account")
+        if was and was != c["account"]:
+            last_move[c["session_id"]] = now
+            pulled.pop(c["session_id"], None)
+    moves, waits, held = swap_plan(views, retry_ok, now, last_move, order,
+                                   pulled={s for s, t in pulled.items() if now - float(t or 0) < MIN_GAP},
+                                   paused={h for h, t in pause.items() if now < float(t or 0)})
+    live = {c["session_id"] for c in claudes}
+    for sid in list(info):
+        if sid not in live:
+            del info[sid]
+    for c in claudes:
+        rec = info.setdefault(c["session_id"], {})
+        rec.update(account=c["account"], waits_until=waits.get(c["session_id"]), held=held.get(c["session_id"]))
+        if c.get("hit_ends"):
+            rec["hit_ends"] = c["hit_ends"]
+        else:
+            rec.pop("hit_ends", None)
+        if rec.get("moved_at") and now - rec["moved_at"] > FROM_SHOWN:
+            rec.pop("from", None)
+            rec.pop("moved_at", None)
+    blocks = {**(st.get("org_blocks") or {}), **(st.get("login_blocks") or {})}
+    saved = None
+    for mv in moves:
+        if mv["rule"] == 6 and now < float(pause.get(mv["to"]) or 0):
+            continue
+        if mv.get("signed_out") or mv["from"] in blocks:
+            if saved is None:
+                st["recommended"] = recommend(views, now, order)
+                st["recommended_fable"] = recommend(views, now, order, "fable")
+                try:
+                    write_state(st)
+                    saved = True
+                except Exception as e:
+                    saved = False
+                    print("claude-autoswap: state not saved, moves off a signed-out account wait: "
+                          f"{type(e).__name__}: {e}", file=sys.stderr)
+            if not saved:
+                continue
+        res = run_mover(mv)
+        entry = {**mv, "at": now, "result": res.get("result", "failed"), "reason": res.get("reason", ""),
+                 "new_session_id": res.get("session_id") or ""}
+        st.setdefault("moves", []).append(entry)
+        old_sid = mv["session_id"]
+        rec = info.setdefault(old_sid, {})
+        if entry["result"] == "moved":
+            if mv["rule"] != 8:
+                last_move[old_sid] = now
+                if mv["rule"] == 6:
+                    pulled[old_sid] = now
+                else:
+                    pulled.pop(old_sid, None)
+            last_try.pop(old_sid, None)
+            rec.update(account=mv["to"], held=None)
+            if mv["rule"] != 8:
+                rec.update(moved_at=now)
+                rec["from"] = mv["from"]
+            if mv["continue"]:
+                rec["woke_at"] = now
+            new_sid = res.get("session_id") or ""
+            if new_sid and new_sid != old_sid:
+                info[new_sid] = info.pop(old_sid)
+                if old_sid in last_move:
+                    last_move[new_sid] = last_move.pop(old_sid)
+                if old_sid in pulled:
+                    pulled[new_sid] = pulled.pop(old_sid)
+        else:
+            refused, was = entry["result"] == "refused", seen.get(old_sid) or {}
+            if refused and old_sid in early:
+                refused_at.pop(old_sid, None)
+                early_at[old_sid] = now
+            else:
+                last_try[old_sid] = now
+                if not refused:
+                    refused_at.pop(old_sid, None)
+                    if isinstance(entry["new_session_id"], str) and entry["new_session_id"] not in ("", old_sid):
+                        last_try[entry["new_session_id"]] = now
+                elif now - float(early_at.get(old_sid) or 0) < RETRY_GAP:
+                    refused_at.pop(old_sid, None)
+                elif was.get("hit"):
+                    refused_at[old_sid] = max(now_(), float(was.get("hit_at") or 0))
+                else:
+                    refused_at[old_sid] = now
+            if mv["rule"] == 6:
+                if entry["result"] != "refused":
+                    pause[mv["to"]] = now + PULL_PAUSE
+            else:
+                rec["held"] = entry["reason"] or entry["result"]
+    st["moves"] = st.get("moves", [])[-KEEP_MOVES:]
+    for d in (last_move, last_try):
+        for sid in list(d):
+            if sid not in live and now - float(d[sid] or 0) >= MIN_GAP:
+                del d[sid]
+    for sid in list(refused_at):
+        if sid not in last_try:
+            del refused_at[sid]
+    for sid in list(early_at):
+        if sid not in last_try or now - float(early_at[sid] or 0) >= RETRY_GAP:
+            del early_at[sid]
+    for sid in list(pulled):
+        if now - float(pulled[sid] or 0) >= MIN_GAP:
+            del pulled[sid]
+    for h in list(pause):
+        if now >= float(pause[h] or 0):
+            del pause[h]
+    for sid in hits:
+        (HITS / f"{sid}.json").unlink(missing_ok=True)
+    if fetch:
+        try:
+            wipe_watch(st, names, now)
+        except Exception as e:
+            print(f"claude-autoswap: wipe watch failed: {type(e).__name__}", file=sys.stderr)
+        try:
+            signin_watch(st, names, now)
+        except Exception as e:
+            print(f"claude-autoswap: sign-in watch failed: {type(e).__name__}", file=sys.stderr)
+    st["recommended"] = recommend(views, now, order)
+    st["recommended_fable"] = recommend(views, now, order, "fable")
+    st["at"] = now
+    return st
+
+
+def cmd_run(once: bool) -> int:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(str(STATE) + ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("claude-autoswap: already running", file=sys.stderr)
+        return 3
+    st = read_state()
+    last_fetch = 0.0
+    while True:
+        now = now_()
+        hit_now = HITS.is_dir() and any(HITS.glob("*.json"))
+        if once or hit_now or now - last_fetch >= METERS_EVERY:
+            fetch = once or now - last_fetch >= METERS_EVERY or hit_now
+            try:
+                st = cycle(st, now, fetch)
+            except Exception as e:
+                print(f"claude-autoswap: cycle failed: {type(e).__name__}: {e}", file=sys.stderr)
+                if once:
+                    return 1
+            else:
+                if fetch:
+                    last_fetch = now
+                write_state(st)
+        if once:
+            return 0
+        time.sleep(HITS_EVERY)
+
+
+def stated_why_not(st: dict) -> dict[str, str]:
+    raw = st.get("not_destination")
+    if not isinstance(raw, dict):
+        return {}
+    return {n: r for n, r in raw.items() if isinstance(n, str) and isinstance(r, str) and r}
+
+
+def signin_line(e: dict | None, now: float, lead: str = "") -> str:
+    if not e:
+        return ""
+    end = iso_epoch(e["ends"])
+    if e["state"] == "out":
+        return f"{lead}SIGNED OUT since {signin_clock(e['out_since'] if e['out_since'] else now, now)}"
+    if end is None:
+        return ""
+    if e["state"] == "due":
+        left = max(0, int(end - now))
+        days, hours = left // 86400, left % 86400 // 3600
+        return f"{lead}sign-in ends in {days} d {hours} h" if days else f"{lead}sign-in ends in {hours} h"
+    return f"{lead}sign-in ends {time.strftime('%m-%d %H:%M', time.localtime(end))} ({max(0, int((end - now) // 86400))} d)"
+
+
+def cmd_status(as_json: bool) -> int:
+    st = read_state()
+    if as_json:
+        print(json.dumps(st, indent=1))
+        return 0
+    now = now_()
+    hm = lambda t: time.strftime("%a %H:%M", time.localtime(t))
+    print(f"recommended for a new Claude: {st.get('recommended') or 'none has room'}")
+    meters, lead = st.get("meters") or {}, "used first"
+    why, wiped_at, signin = stated_why_not(st), stated_wiped(st), stated_signin(st)
+    views = [account_view(n, m, [], 0, now, why.get(n, "")) for n, m in meters.items() if isinstance(m, dict)]
+    for v in sorted((v for v in views if v["usable"] and expiring(v, now, "other", NEW_ROOM)),
+                    key=lambda v: v["w_resets"]):
+        print(f"{lead}: {v['name']} ({100 - v['w']:.0f}% of its week is lost at {hm(v['w_resets'])} unless used)")
+        lead = "then"
+    for n, m in (st.get("meters") or {}).items():
+        at, live_at = float(m.get("at") or 0), float(m.get("live_at") or 0)
+        newest = max(at, live_at)
+        source = "live" if live_at > at else "endpoint"
+        age = f"{int((now - newest) / 60)} min old, {source}" if newest else "never read"
+        resets = f" resets {time.strftime('%a %H:%M', time.localtime(m['week_resets']))}" \
+            if m.get("week_resets") else ""
+        error = f", {m['error']}" if m.get("error") else ""
+        sign = f"; not a destination: {why[n]}" if n in why else ""
+        if n in wiped_at:
+            sign += f"; sign-in wiped at {hm(wiped_at[n])}{emptied_note(n, wiped_at[n], hm)}"
+        sign += signin_line(signin.get(n), now, "; ")
+        five = "5h none" if m.get("no_five_hour") else f"5h {m.get('five_hour')}%"
+        print(f"  {n:<9} {five}  week {m.get('week')}%{resets}  Fable {m.get('fable')}%  "
+              f"speed {st.get('speeds', {}).get(n, 0)}%/min  ({age}{error}{sign})")
+    for n, t in sorted(wiped_at.items()):
+        if n not in (st.get("meters") or {}):
+            print(f"  {n:<9} sign-in wiped at {hm(t)}{emptied_note(n, t, hm)}")
+    for n, e in sorted(signin.items()):
+        if n not in (st.get("meters") or {}) and signin_line(e, now):
+            print(f"  {n:<9} {signin_line(e, now)}")
+    for mv in (st.get("moves") or [])[-10:]:
+        when = time.strftime("%H:%M", time.localtime(mv["at"]))
+        asking = ", mid-question" if mv.get("asking") else ""
+        stranded = ", signed out" if mv.get("signed_out") else ""
+        woken = ", woken in place" if mv["rule"] == 8 else ""
+        print(f"  {when} {mv.get('name') or mv['session_id'][:8]}: {mv['from']} -> {mv['to']} "
+              f"(rule {mv['rule']}{asking}{stranded}{woken}) {mv['result']} {mv.get('reason') or ''}")
+    return 0
+
+
+def cmd_recommend(model: str = "") -> int:
+    st = read_state()
+    fresh = time.time() - float(st.get("at") or 0) < 600
+    key = "recommended_fable" if "fable" in model.lower() else "recommended"
+    print(st.get(key) or "" if fresh else "")
+    return 0
+
+
+HOOK_COMMAND = f"{HOME}/.local/bin/claude-autoswap hook"
+
+
+def cmd_hook() -> int:
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return 0
+    if not isinstance(data, dict) or data.get("error") != "rate_limit" or not data.get("session_id"):
+        return 0
+    try:
+        HITS.mkdir(parents=True, exist_ok=True)
+        (HITS / f"{data['session_id']}.json").write_text(json.dumps({**data, "at": time.time()}))
+    except OSError:
+        pass
+    return 0
+
+
+def cmd_install_hook() -> int:
+    for name in DK.accounts():
+        path = DK.ACCTS / name / "settings.json"
+        try:
+            s = json.loads(path.read_text()) if path.exists() else {}
+        except ValueError:
+            print(f"{name}: settings.json is not JSON, left alone", file=sys.stderr)
+            continue
+        entries = s.setdefault("hooks", {}).setdefault("StopFailure", [])
+        if any(h.get("command") == HOOK_COMMAND for e in entries for h in e.get("hooks", [])):
+            print(f"{name}: already there")
+            continue
+        backup = path.with_name("settings.json.before-autoswap")
+        if path.exists() and not backup.exists():
+            shutil.copy2(path, backup)
+        entries.append({"matcher": "rate_limit", "hooks": [{"type": "command", "command": HOOK_COMMAND}]})
+        tmp = path.with_name(".settings.json.autoswap.tmp")
+        tmp.write_text(json.dumps(s, indent=2) + "\n")
+        os.replace(tmp, path)
+        print(f"{name}: added")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[0] if argv else ""
+    if cmd == "run":
+        return cmd_run("--once" in argv)
+    if cmd == "status":
+        return cmd_status("--json" in argv)
+    if cmd == "recommend":
+        model = ""
+        for i, a in enumerate(argv[1:], 1):
+            if a == "--model" and i + 1 < len(argv):
+                model = argv[i + 1]
+            elif a.startswith("--model="):
+                model = a.split("=", 1)[1]
+        return cmd_recommend(model)
+    if cmd == "hook":
+        return cmd_hook()
+    if cmd == "install-hook":
+        return cmd_install_hook()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

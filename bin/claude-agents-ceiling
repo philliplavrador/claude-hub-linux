@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""claude-agents-ceiling: stop the one runaway process in agents.slice: when the lane stalls at its ceiling, and at once
+when any one program passes RUNAWAY_BYTES.
+
+agents.slice holds agent work under MemoryHigh=44G and MemorySwapMax=16G and no MemoryMax. A ceiling like that never
+kills: a lane over it with its swap used up stalls on every allocation, for as long as the process that filled it keeps
+asking. A single runaway test process can fill the lane's memory and its swap: the lane then hits its swap cap again
+and again, the load climbs and everything that touches the disk waits. Stopping that one process frees the memory at
+once, but a test runner goes straight on to its next worker and the lane stalls again.
+
+So this watches the lane, and acts by two rules. The first, the size rule: any one program in the lane that is no
+Claude and has passed RUNAWAY_BYTES (16 GB of its own memory plus swap, RssAnon + VmSwap: page cache of a big mapped
+file or shared memory does not count) gets SIGTERM, and SIGKILL RUNAWAY_GRACE later, with no stall needed. The stall
+rule waits for 15 s of stall before it acts, and the whole PC freezes in that time, so the size rule looks every
+SIZE_TICK seconds (a scan is cheap), is not paused by COOLDOWN, signals every victim of a round at once, and waits on
+all of them together, so one that ignores SIGTERM does not hold up the next scan for long. A scan lists the lane from
+its own cgroup.procs files (the lane's tree, not every pid of the PC) and reads the cwd and exe links only of a process
+a rule can act on. The second rule, when the lane has stalled for a while, stops the one process that is the cause:
+
+  - Stalled: the lane's own memory pressure (its memory.pressure, `full avg10`: the share of the last 10 s in which
+    every non-idle task in the lane waited on memory) at STALL_PERCENT or more on STRIKES looks in a row, TICK
+    seconds apart (by the clock, though the loop runs every SIZE_TICK). A stall of the whole PC that reaches the
+    lane counts too: the lane is reclaimed first.
+  - The one: the biggest process in the lane by memory in RAM plus swap (VmRSS + VmSwap), owned by the lane's
+    user, and never a Claude (an executable directly in ~/.local/share/claude/versions/, the rule
+    claude-agents-lane uses): a session is an agent's whole conversation, while a test, a build or a browser it
+    started can be run again. Only one of at least MIN_BYTES: a lane full of half-gigabyte sessions has no
+    runaway, and stopping one of them would not end the stall. Then it says so once and stops nothing. When that
+    biggest one is a process that could not be stopped (still there KILL_WAIT s after SIGKILL, or refused a signal,
+    by either rule), it says so once and stops nothing: the next-biggest one is not the cause.
+  - Stopping, for both rules: SIGTERM, then SIGKILL if it is still there RUNAWAY_GRACE seconds later, then
+    KILL_WAIT seconds (RUNAWAY_GRACE for the stall rule, which blocks the loop while it waits) before calling a
+    survivor stuck. It goes through a pidfd opened before the pid's start time was checked, so a pid that was
+    reused in the meantime is never signalled. One process, never its group or its parent: the runner that started it
+    sees one failed test and goes on. A signal the kernel refuses is said ("refused"), once, and not tried again
+    every second.
+  - Then COOLDOWN seconds before a look counts again (avg10 needs about that long to come down; a size-rule stop
+    starts it too, since avg10 lingers after the memory is freed), one journal line (no command line: prompts and
+    session titles are private; a folder or program name is written with control characters and bytes that are
+    no UTF-8 escaped) and a desktop notice, which is not waited for. A process that could not be stopped is said
+    once, not every second, and is not signalled again. An error in one round is written as one line and the loop
+    goes on: this must not be the process that stays down.
+
+  watch [--dry-run]   the loop (claude-agents-ceiling.service); --dry-run says what it would stop, stops nothing
+  status [--json]     the lane now: memory, swap, pressure, which processes are over the size limit, and which
+                      process a stall stop would pick
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import pwd
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+
+SLICE = "agents.slice"
+TICK = 5.0
+STRIKES = 3
+STALL_PERCENT = 40.0
+MIN_BYTES = 4 << 30
+COOLDOWN = 30.0
+RUNAWAY_BYTES = 16 << 30
+SIZE_TICK = 1.0
+RUNAWAY_GRACE = 2.0
+KILL_WAIT = 5.0
+GB = 1 << 30
+
+
+def owner_home() -> str:
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return ""
+    return os.path.normpath(home) if os.path.isabs(home) else ""
+
+
+HOME = owner_home()
+CLAUDE_VERSIONS = os.path.join(HOME, ".local", "share", "claude", "versions") if HOME else ""
+
+
+class Config:
+    def __init__(self, proc: str = "/proc", cgroup: str = "/sys/fs/cgroup", uid: int = 0):
+        self.proc, self.cgroup, self.uid = proc, cgroup, uid
+        self.lane = f"/user.slice/user-{uid}.slice/user@{uid}.service/{SLICE}"
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        env = os.environ
+        return cls(proc=env.get("CLAUDE_HUB_AGENTS_CEILING_PROC") or "/proc",
+                   cgroup=env.get("CLAUDE_HUB_AGENTS_CEILING_CGROUP") or "/sys/fs/cgroup",
+                   uid=int(env.get("CLAUDE_HUB_AGENTS_CEILING_UID") or os.getuid()))
+
+    def lane_file(self, name: str) -> str:
+        return os.path.join(self.cgroup, self.lane.lstrip("/"), name)
+
+    def in_lane(self, cgroup: str) -> bool:
+        return cgroup == self.lane or cgroup.startswith(self.lane + "/")
+
+    def path(self, pid: int, name: str) -> str:
+        return os.path.join(self.proc, str(pid), name)
+
+
+def _under_test() -> bool:
+    return "unittest" in sys.modules and os.path.basename(sys.argv[0]) != os.path.basename(__file__)
+
+
+
+def read_text(path: str) -> str:
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+def read_bytes_value(path: str) -> int | None:
+    try:
+        text = read_text(path).strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def full_avg10(text: str) -> float | None:
+    for line in text.split("\n"):
+        if line.startswith("full "):
+            for field in line.split()[1:]:
+                key, _, value = field.partition("=")
+                if key == "avg10":
+                    try:
+                        return float(value)
+                    except ValueError:
+                        return None
+    return None
+
+
+class Lane:
+    __slots__ = ("current", "high", "swap", "swap_max", "full")
+
+    def __init__(self, current, high, swap, swap_max, full):
+        self.current, self.high, self.swap, self.swap_max, self.full = current, high, swap, swap_max, full
+
+    def stalled(self) -> bool:
+        return self.full is not None and self.full >= STALL_PERCENT
+
+    def describe(self) -> str:
+        def gb(value, digits=1):
+            return "?" if value is None else f"{value / GB:.{digits}f}"
+        high = "no ceiling" if self.high is None else f"{gb(self.high, 0)} GB"
+        swap_max = "no cap" if self.swap_max is None else f"{gb(self.swap_max, 0)} GB"
+        full = "?" if self.full is None else f"{self.full:.0f}%"
+        return f"lane memory {gb(self.current)} GB of {high}, swap {gb(self.swap)} GB of {swap_max}, stalled {full}"
+
+    def as_dict(self) -> dict:
+        return {"memory": self.current, "memory_high": self.high, "swap": self.swap, "swap_max": self.swap_max,
+                "full_avg10": self.full}
+
+
+def read_lane(cfg: Config) -> Lane | None:
+    try:
+        pressure = read_text(cfg.lane_file("memory.pressure"))
+    except OSError:
+        return None
+    return Lane(read_bytes_value(cfg.lane_file("memory.current")), read_bytes_value(cfg.lane_file("memory.high")),
+                read_bytes_value(cfg.lane_file("memory.swap.current")),
+                read_bytes_value(cfg.lane_file("memory.swap.max")), full_avg10(pressure))
+
+
+
+class Proc:
+    __slots__ = ("pid", "start", "comm", "size", "anon", "cgroup", "cwd", "claude")
+
+    def __init__(self, pid: int, start: int, comm: str, size: int, anon: int, cgroup: str, cwd: str, claude: bool):
+        self.pid, self.start, self.comm, self.size = pid, start, comm, size
+        self.anon = anon
+        self.cgroup, self.cwd, self.claude = cgroup, cwd, claude
+
+    def as_dict(self) -> dict:
+        return {"pid": self.pid, "comm": self.comm, "bytes": self.size, "anon_bytes": self.anon,
+                "cgroup": self.cgroup, "cwd": self.cwd}
+
+
+def read_cgroup(path: str) -> str | None:
+    try:
+        text = read_text(path)
+    except OSError:
+        return None
+    for line in text.split("\n"):
+        if line.startswith("0::"):
+            return line[3:]
+    return None
+
+
+def parse_stat(text: str) -> tuple[str, str, int]:
+    close = text.rfind(")")
+    fields = text[close + 2:].split()
+    return text[text.find("(") + 1:close], fields[0], int(fields[19])
+
+
+def parse_status(text: str) -> tuple[int | None, int | None, int, int]:
+    uid, rss, swap, anon = None, None, 0, 0
+    for line in text.split("\n"):
+        key, _, rest = line.partition(":")
+        if key == "Uid":
+            uid = int(rest.split()[0])
+        elif key == "VmRSS":
+            rss = int(rest.split()[0])
+        elif key == "VmSwap":
+            swap = int(rest.split()[0])
+        elif key == "RssAnon":
+            anon = int(rest.split()[0])
+    return uid, rss, swap, anon
+
+
+def read_link(path: str) -> str:
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return ""
+    return target[:-len(" (deleted)")] if target.endswith(" (deleted)") else target
+
+
+def is_claude(exe: str) -> bool:
+    return bool(exe) and bool(CLAUDE_VERSIONS) and os.path.dirname(exe) == CLAUDE_VERSIONS
+
+
+def candidate(size: int, anon: int) -> bool:
+    return size >= MIN_BYTES or anon >= RUNAWAY_BYTES
+
+
+def lane_pids(cfg: Config) -> list[int]:
+    pids: set[int] = set()
+    todo = [os.path.join(cfg.cgroup, cfg.lane.lstrip("/"))]
+    while todo:
+        folder = todo.pop()
+        try:
+            for line in read_text(os.path.join(folder, "cgroup.procs")).split("\n"):
+                line = line.strip()
+                if line.isdigit():
+                    pids.add(int(line))
+        except OSError:
+            pass
+        try:
+            with os.scandir(folder) as entries:
+                todo.extend(e.path for e in entries if e.is_dir(follow_symlinks=False))
+        except OSError:
+            continue
+    return sorted(pids)
+
+
+def lane_procs(cfg: Config, full: bool = False) -> list[Proc]:
+    found = []
+    for pid in lane_pids(cfg):
+        cgroup = read_cgroup(cfg.path(pid, "cgroup"))
+        if cgroup is None or not cfg.in_lane(cgroup):
+            continue
+        try:
+            uid, rss, swap, anon = parse_status(read_text(cfg.path(pid, "status")))
+            comm, state, start = parse_stat(read_text(cfg.path(pid, "stat")))
+        except (OSError, ValueError, IndexError):
+            continue
+        if uid != cfg.uid or rss is None or state in ("Z", "X"):
+            continue
+        size, own = (rss + swap) * 1024, (anon + swap) * 1024
+        if full or candidate(size, own):
+            cwd, claude = read_link(cfg.path(pid, "cwd")), is_claude(read_link(cfg.path(pid, "exe")))
+        else:
+            cwd, claude = "", False
+        found.append(Proc(pid, start, comm, size, own, cgroup, cwd, claude))
+    return found
+
+
+def lane_procs_old(cfg: Config) -> list[Proc]:
+    try:
+        names = os.listdir(cfg.proc)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        cgroup = read_cgroup(cfg.path(pid, "cgroup"))
+        if cgroup is None or not cfg.in_lane(cgroup):
+            continue
+        try:
+            uid, rss, swap, anon = parse_status(read_text(cfg.path(pid, "status")))
+            comm, state, start = parse_stat(read_text(cfg.path(pid, "stat")))
+        except (OSError, ValueError, IndexError):
+            continue
+        if uid != cfg.uid or rss is None or state in ("Z", "X"):
+            continue
+        found.append(Proc(pid, start, comm, (rss + swap) * 1024, (anon + swap) * 1024, cgroup,
+                          read_link(cfg.path(pid, "cwd")),
+                          is_claude(read_link(cfg.path(pid, "exe")))))
+    return found
+
+
+def pick(procs: list[Proc]) -> Proc | None:
+    fit = [p for p in procs if not p.claude and p.size >= MIN_BYTES]
+    return max(fit, key=lambda p: p.size) if fit else None
+
+
+
+def still_same(cfg: Config, proc: Proc) -> bool:
+    try:
+        return parse_stat(read_text(cfg.path(proc.pid, "stat")))[2] == proc.start
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+class Signaller:
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def open(self, proc: Proc) -> int | None:
+        if _under_test():
+            return None
+        try:
+            fd = os.pidfd_open(proc.pid)
+        except OSError:
+            return None
+        if not still_same(self.cfg, proc):
+            os.close(fd)
+            return None
+        return fd
+
+    def send(self, fd: int, sig: int) -> str:
+        try:
+            signal.pidfd_send_signal(fd, sig)
+        except ProcessLookupError:
+            return "gone"
+        except OSError:
+            return "refused"
+        return "sent"
+
+    def wait(self, fd: int, timeout: float) -> bool:
+        return bool(self.wait_all([fd], timeout))
+
+    def wait_all(self, fds: list, timeout: float) -> list:
+        poller = select.poll()
+        for fd in fds:
+            poller.register(fd, select.POLLIN)
+        ended, deadline = [], time.monotonic() + timeout
+        while len(ended) < len(fds):
+            remaining = max(0.0, deadline - time.monotonic())
+            for fd, _ in poller.poll(math.ceil(remaining * 1000)):
+                poller.unregister(fd)
+                ended.append(fd)
+            if remaining <= 0:
+                break
+        return ended
+
+    def close(self, fd: int) -> None:
+        os.close(fd)
+
+
+def pick_over(procs: list[Proc]) -> list[Proc]:
+    return sorted((p for p in procs if not p.claude and p.anon >= RUNAWAY_BYTES), key=lambda p: -p.anon)
+
+
+def stop_many(procs: list[Proc], signaller, grace: float, kill_wait: float) -> list[tuple[str, str]]:
+    results: list[tuple[str, str]] = [("gone", "")] * len(procs)
+    handles: dict[int, object] = {}
+    try:
+        for i, proc in enumerate(procs):
+            try:
+                handle = signaller.open(proc)
+                if handle is None:
+                    continue
+                handles[i] = handle
+                sent = signaller.send(handle, signal.SIGTERM)
+                if sent != "sent":
+                    results[i] = ("gone" if sent == "gone" else "refused", "")
+                    del handles[i]
+                    signaller.close(handle)
+            except Exception as exc:
+                results[i] = ("refused", f"{type(exc).__name__}: {clean(str(exc))}")
+        pending = {i: h for i, h in handles.items() if results[i][0] == "gone"}
+        ended = signaller.wait_all(list(pending.values()), grace) if pending else []
+        left = {}
+        for i, handle in pending.items():
+            if handle in ended:
+                results[i] = ("ended", "")
+            else:
+                left[i] = handle
+        for i, handle in list(left.items()):
+            try:
+                if signaller.send(handle, signal.SIGKILL) == "refused":
+                    results[i] = ("refused", "")
+                    del left[i]
+            except Exception as exc:
+                results[i] = ("refused", f"{type(exc).__name__}: {clean(str(exc))}")
+                del left[i]
+        ended = signaller.wait_all(list(left.values()), kill_wait) if left else []
+        for i, handle in left.items():
+            results[i] = ("killed" if handle in ended else "stuck", "")
+        return results
+    finally:
+        for handle in handles.values():
+            try:
+                signaller.close(handle)
+            except Exception:
+                pass
+
+
+SAID = {"gone": "ended by itself before a signal:", "ended": "stopped (SIGTERM):",
+        "killed": "killed (SIGKILL after SIGTERM):", "stuck": "SIGKILL sent, still not ended:",
+        "refused": "the kernel refused a signal:"}
+
+
+def clean(text: str) -> str:
+    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+    return "".join(ch.encode("unicode_escape").decode("ascii") if unicodedata.category(ch)[0] == "C" else ch
+                   for ch in text)
+
+
+def describe(cfg: Config, proc: Proc, size: int | None = None) -> str:
+    where = proc.cgroup[len(cfg.lane) + 1:] if proc.cgroup.startswith(cfg.lane + "/") else SLICE
+    shown = proc.size if size is None else size
+    return clean(f"pid {proc.pid} {proc.comm} ({shown / GB:.1f} GB) in {where}, working in {proc.cwd or '?'}")
+
+
+def say(line: str) -> None:
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
+
+
+_NOTICES: list[tuple[subprocess.Popen, float]] = []
+NOTICE_LIFE = 30.0
+
+
+def reap_notices() -> None:
+    for entry in list(_NOTICES):
+        proc, started = entry
+        if proc.poll() is None:
+            if time.monotonic() - started < NOTICE_LIFE:
+                continue
+            proc.kill()
+            proc.wait()
+        _NOTICES.remove(entry)
+
+
+def notify(title: str, body: str) -> bool | None:
+    if _under_test() and not os.environ.get("CLAUDE_HUB_AGENTS_CEILING_NOTIFY"):
+        return None
+    cmd = os.environ.get("CLAUDE_HUB_AGENTS_CEILING_NOTIFY") or shutil.which("notify-send")
+    if not cmd:
+        return None
+    try:
+        reap_notices()
+        proc = subprocess.Popen([cmd, "-a", "Claude hub", "-u", "normal", "-i", "dialog-warning", title, body],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _NOTICES.append((proc, time.monotonic()))
+    except Exception:
+        return False
+    return True
+
+
+
+class Watcher:
+
+    def __init__(self, cfg, dry_run, signaller, tell, out, clock):
+        self.cfg, self.dry_run, self.signaller = cfg, dry_run, signaller
+        self.tell, self.out, self.clock = tell, out, clock
+        self.strikes, self.quiet_until, self.told_none, self.next_look = 0, 0.0, False, 0.0
+        self.procs: list[Proc] = []
+        self.blocked: set[tuple[int, int]] = set()
+        self.said: set[tuple[int, int]] = set()
+        self.told_blocked: set[tuple[int, int]] = set()
+        self.last_error: str | None = None
+        self.errored = False
+
+    def guard(self, where: str, fn, *args) -> None:
+        try:
+            fn(*args)
+        except Exception as exc:
+            self.errored = True
+            line = f"{where} failed: {type(exc).__name__}: {clean(str(exc))}; carrying on"
+            if line != self.last_error:
+                self.last_error = line
+                try:
+                    self.out(line)
+                except Exception:
+                    pass
+
+    def round(self) -> None:
+        self.errored, self.procs = False, []
+        self.guard("notice cleanup", reap_notices)
+        self.guard("size rule", self.size_rule)
+        self.guard("stall rule", self.stall_rule)
+        if not self.errored:
+            self.last_error = None
+
+    def size_rule(self) -> None:
+        self.procs = lane_procs(self.cfg)
+        live = {(p.pid, p.start) for p in self.procs}
+        self.blocked &= live
+        self.said &= live
+        self.told_blocked &= live
+        victims = [p for p in pick_over(self.procs) if (p.pid, p.start) not in self.blocked | self.said]
+        if not victims:
+            return
+        lane = read_lane(self.cfg)
+        where = f" ({lane.describe()})" if lane else ""
+        mark = f"over {RUNAWAY_BYTES // GB} GB for one program:"
+        if self.dry_run:
+            for victim in victims:
+                self.said.add((victim.pid, victim.start))
+                self.out(f"{mark} would stop {describe(self.cfg, victim, victim.anon)}{where}")
+            return
+        try:
+            outcomes = stop_many(victims, self.signaller, RUNAWAY_GRACE, KILL_WAIT)
+        except Exception:
+            self.blocked.update((v.pid, v.start) for v in victims)
+            raise
+        if any(result != "gone" for result, _ in outcomes):
+            self.quiet_until = self.clock() + COOLDOWN
+        for victim, (result, _) in zip(victims, outcomes):
+            if result in ("stuck", "refused"):
+                self.blocked.add((victim.pid, victim.start))
+        for victim, (result, note) in zip(victims, outcomes):
+            self.guard("size rule report", self.report_size, victim, result, note, where, mark)
+
+    def report_size(self, victim: Proc, result: str, note: str, where: str, mark: str) -> None:
+        self.out(f"{mark} {SAID[result]} {describe(self.cfg, victim, victim.anon)}{where}"
+                 + (f" ({note})" if note else ""))
+        self.tell_result(victim, result, victim.anon,
+                         f"one program in agent work may use at most {RUNAWAY_BYTES // GB} GB")
+
+    def tell_result(self, victim: Proc, result: str, size: int, why: str) -> None:
+        if result in ("stuck", "refused"):
+            self.tell("Could not stop a runaway agent process",
+                      f"{clean(victim.comm)} (pid {victim.pid}) is at {size / GB:.0f} GB and could not be stopped; "
+                      f"Claude sessions keep running. journalctl --user -u claude-agents-ceiling")
+        elif result != "gone":
+            self.tell("Stopped a runaway agent process",
+                      f"{clean(victim.comm)} (pid {victim.pid}) had grown to {size / GB:.0f} GB; {why}. "
+                      f"Claude sessions keep running. journalctl --user -u claude-agents-ceiling")
+
+    def stall_rule(self) -> None:
+        now = self.clock()
+        if now + SIZE_TICK / 2 < self.next_look:
+            return
+        self.next_look = now + TICK
+        lane = read_lane(self.cfg)
+        if now < self.quiet_until:
+            self.strikes = 0
+        elif lane is not None and lane.stalled():
+            self.strikes += 1
+        else:
+            self.strikes, self.told_none = 0, False
+        if self.strikes < STRIKES:
+            return
+        self.strikes = 0
+        victim = pick(self.procs)
+        if victim is None:
+            if not self.told_none:
+                self.out(f"stalled ({lane.describe()}), but no process of {MIN_BYTES // GB} GB or more that is no "
+                         f"Claude: nothing stopped")
+                self.told_none = True
+        elif (victim.pid, victim.start) in self.blocked:
+            if (victim.pid, victim.start) not in self.told_blocked:
+                self.told_blocked.add((victim.pid, victim.start))
+                self.out(f"stalled ({lane.describe()}), but the biggest process, {describe(self.cfg, victim)}, is "
+                         f"one that could not be stopped: nothing else is stopped")
+        elif self.dry_run:
+            self.out(f"would stop {describe(self.cfg, victim)} ({lane.describe()})")
+            self.quiet_until = self.clock() + COOLDOWN
+        else:
+            (result, note), = stop_many([victim], self.signaller, RUNAWAY_GRACE, RUNAWAY_GRACE)
+            self.quiet_until = self.clock() + COOLDOWN
+            if result in ("stuck", "refused"):
+                self.blocked.add((victim.pid, victim.start))
+            self.out(f"{SAID[result]} {describe(self.cfg, victim)} ({lane.describe()})"
+                     + (f" ({note})" if note else ""))
+            self.tell_result(victim, result, victim.size, "it stalled agent work on the PC")
+
+
+def watch(cfg: Config, dry_run: bool = False, *, signaller=None, tell=notify, out=say, clock=time.monotonic,
+          sleep=time.sleep, rounds: int | None = None) -> int:
+    signaller = signaller or Signaller(cfg)
+    out(f"watching {SLICE} every {SIZE_TICK:g} s: any one program that is no Claude and has passed "
+        f"{RUNAWAY_BYTES // GB} GB of its own memory gets SIGTERM, and SIGKILL {RUNAWAY_GRACE:g} s later; and a stall "
+        f"(full avg10 >= {STALL_PERCENT:g}% on {STRIKES} looks {TICK:g} s apart) stops the biggest process of "
+        f"{MIN_BYTES // GB} GB or more that is no Claude" + (" (dry run: nothing is stopped)" if dry_run else ""))
+    watcher = Watcher(cfg, dry_run, signaller, tell, out, clock)
+    while rounds is None or rounds > 0:
+        if rounds is not None:
+            rounds -= 1
+        watcher.round()
+        sleep(SIZE_TICK)
+    return 0
+
+
+def cmd_status(cfg: Config, as_json: bool) -> int:
+    lane = read_lane(cfg)
+    procs = lane_procs(cfg, full=True)
+    victim = pick(procs)
+    over = pick_over(procs)
+    others = [p for p in procs if not p.claude]
+    biggest = max(others, key=lambda p: p.size) if others else None
+    if as_json:
+        print(json.dumps({"lane": lane.as_dict() if lane else None, "stalled": bool(lane and lane.stalled()),
+                          "processes": len(procs), "claudes": sum(p.claude for p in procs),
+                          "biggest": biggest.as_dict() if biggest else None,
+                          "limit_bytes": RUNAWAY_BYTES, "over_limit": [p.as_dict() for p in over],
+                          "would_stop": victim.as_dict() if victim else None}, indent=2))
+        return 0
+    print(lane.describe() if lane else f"{SLICE}: no memory.pressure to read (no lane, or no PSI)")
+    print(f"{len(procs)} processes in the lane, {sum(p.claude for p in procs)} of them Claudes")
+    print(f"biggest that is no Claude: {describe(cfg, biggest)}" if biggest else "no process in it is no Claude")
+    if over:
+        print(f"over {RUNAWAY_BYTES // GB} GB of its own memory for one program (checked every second; SIGTERM, "
+              f"SIGKILL {RUNAWAY_GRACE:g} s later): " + "; ".join(describe(cfg, p, p.anon) for p in over))
+    else:
+        print(f"none over {RUNAWAY_BYTES // GB} GB for one program")
+    print(f"a stall stop would end: {describe(cfg, victim)}" if victim
+          else f"a stall stop would end nothing (none of {MIN_BYTES // GB} GB or more)")
+    return 0
+
+
+COMMANDS = {"watch": {"--dry-run"}, "status": {"--json"}}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if not args or args[0] not in COMMANDS or not set(args[1:]) <= COMMANDS[args[0]]:
+        print("usage: claude-agents-ceiling watch [--dry-run] | status [--json]", file=sys.stderr)
+        return 2
+    cfg = Config.from_env()
+    if args[0] == "watch":
+        return watch(cfg, "--dry-run" in args[1:])
+    return cmd_status(cfg, "--json" in args[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

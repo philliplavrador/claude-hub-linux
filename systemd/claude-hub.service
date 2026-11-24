@@ -1,0 +1,13 @@
+[Unit]
+Description=Start the Claude hub popup hidden at login, so the first Meta+Return shows it at once
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-hub start
+Slice=background.slice
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target

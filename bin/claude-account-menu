@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+ACCTS=${CLAUDE_HUB_ACCOUNTS:-$HOME/.claude-accounts}
+CACHE=$HOME/.cache/claude-hub-account
+OUT=''; CURRENT=''; TITLE='Claude account'
+while [ $# -gt 0 ]; do
+  case $1 in
+    --out) OUT=${2:-}; shift 2 ;;
+    --current) CURRENT=${2:-}; shift 2 ;;
+    --title) TITLE=${2:-}; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$OUT" ] || { echo "--out is required" >&2; exit 2; }
+mkdir -p "$CACHE" 2>/dev/null
+
+MARK='← now'
+
+ESC=$'\e'; BOLD=$'\e[1m'; DIM=$'\e[2m'; OFF=$'\e[0m'; REV=$'\e[7m'; STRIKE=$'\e[9m'
+GREEN=$'\e[32m'; YELLOW=$'\e[33m'; RED=$'\e[31m'; CYAN=$'\e[36m'
+
+is_paused() { [ -e "$ACCTS/$1/.claude-paused" ]; }
+
+ORDER=''
+
+rank_of() {
+  local i=0 e
+  for e in $ORDER; do [ "$e" = "$1" ] && { echo "$i"; return; }; i=$((i+1)); done
+  echo 90
+}
+
+names=(); mails=()
+while IFS=$'\t' read -r _rank n m; do
+  names+=("$n"); mails+=("$m")
+done < <(
+  for d in "$ACCTS"/*/; do
+    [ -f "$d/.credentials.json" ] || [ -e "$d/.claude-paused" ] || continue
+    n=$(basename "$d")
+    m=$(python3 -c "
+import json,sys
+try: print(json.load(open('${d%/}/.claude.json')).get('oauthAccount',{}).get('emailAddress','') or '?')
+except Exception: print('?')" 2>/dev/null)
+    printf '%02d\t%s\t%s\n' "$(rank_of "$m")" "$n" "$m"
+  done | sort -t$'\t' -k1,1n -k3,3
+)
+[ ${#names[@]} -gt 0 ] || { echo "no Claude accounts in $ACCTS" >&2; exit 2; }
+
+nw=6; mw=28
+for n in "${names[@]}"; do [ ${#n} -gt $nw ] && nw=${#n}; done
+for m in "${mails[@]}"; do [ ${#m} -gt $mw ] && mw=${#m}; done
+
+access_token() {        # the account's short pass, or nothing when it has run out
+  python3 -c "
+import json, time
+try:
+    d = json.load(open('$ACCTS/$1/.credentials.json'))['claudeAiOauth']
+    if d.get('expiresAt', 0) / 1000 > time.time() + 60: print(d['accessToken'])
+except Exception: pass" 2>/dev/null
+}
+TIMEOUT_WRAPPER=${CLAUDE_HUB_ACCOUNT_MENU_TIMEOUT_WRAPPER:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/claude-timeout}
+renew_pass() {
+  local guard=(timeout 60)
+  [ -f "$TIMEOUT_WRAPPER" ] && [ -x "$TIMEOUT_WRAPPER" ] && guard=(timeout -k 5 115 "$TIMEOUT_WRAPPER" 60 --)
+  CLAUDE_CONFIG_DIR=$ACCTS/$1 flock "$CACHE/renew-$1.lock" "${guard[@]}" \
+    claude -p ok --model haiku --max-turns 1 --setting-sources '' \
+           --no-session-persistence --strict-mcp-config </dev/null >/dev/null 2>&1
+}
+to_fields() {
+  python3 -c "
+import sys, json, datetime
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+rows = {}
+if sys.argv[1] == 'api':
+    if 'limits' not in d: sys.exit(1)   # an error reply is a failed fetch, not zeros
+    for l in d['limits']:
+        k = l.get('kind')
+        if k == 'weekly_scoped':
+            s = (l.get('scope') or {}).get('model') or {}
+            k = 'fable' if (s.get('display_name') or '').lower().startswith('fable') else 'scoped'
+        rows[k] = (l.get('percent'), l.get('resets_at'))
+else:
+    def pct(w): return w.get('used_percentage', w.get('utilization'))
+    for src, k in (('five_hour', 'session'), ('seven_day', 'weekly_all')):
+        w = d.get(src) or {}
+        if w: rows[k] = (pct(w), w.get('resets_at'))
+    for w in d.get('model_scoped') or []:
+        if (w.get('display_name') or '').lower().startswith('fable'):
+            rows['fable'] = (pct(w), w.get('resets_at'))
+def fmt(t):
+    if not t: return ''
+    try:
+        dt = (datetime.datetime.fromtimestamp(t) if isinstance(t, (int, float))
+              else datetime.datetime.fromisoformat(t)).astimezone()
+        return str(int(dt.timestamp()))
+    except Exception: return ''
+out = []
+for k in ('session', 'weekly_all', 'fable'):
+    p, r = rows.get(k, (None, None))
+    out.append('-' if p is None else str(round(p)))
+    out.append(fmt(r))
+old = (sys.argv[2] if len(sys.argv) > 2 else '').split('|')
+if sys.argv[1] == 'api':
+    # the endpoint shows a week (with a number: a degenerate entry is no claim) but no session entry (and no
+    # top-level five_hour): no 5-hour limit on this account
+    wk = rows.get('weekly_all', (None, None))[0]
+    if type(wk) in (int, float) and 'session' not in rows and d.get('five_hour') is None: out[0:2] = ['none', '']
+else:
+    # a status line without a 5-hour meter proves nothing, so the old 5-hour stays; and one that carries a number while
+    # the old line says none leaves it none: only the endpoint can say the limit is back
+    if len(old) == 6 and ('session' not in rows or old[0] == 'none'): out[0:2] = old[0:2]
+# A window reports no Fable share, so the last one known stays (argument 2: the old line).
+if 'fable' not in rows and len(old) == 6: out[4:6] = old[4:6]
+print('|'.join(x or '.' for x in out))
+" "$@" 2>/dev/null
+}
+fetch_usage() {
+  local n=$1 tok reply code
+  tok=$(access_token "$n")
+  [ -n "$tok" ] || { renew_pass "$n"; tok=$(access_token "$n"); }
+  [ -n "$tok" ] || return 1
+  reply=$(curl -s --max-time 8 -w '\n%{http_code}' -H "Authorization: Bearer $tok" \
+          -H 'anthropic-beta: oauth-2025-04-20' https://api.anthropic.com/api/oauth/usage 2>/dev/null)
+  code=${reply##*$'\n'}
+  [ "$code" = 429 ] && return 2
+  printf '%s' "${reply%$'\n'*}" | to_fields api > "$CACHE/usage-$n.tmp" &&
+    mv "$CACHE/usage-$n.tmp" "$CACHE/usage-$n"
+}
+for n in "${names[@]}"; do
+  is_paused "$n" && continue                    # nothing is read, or renewed with a Claude, for a paused account
+  fetch_usage "$n" &
+done
+
+CODEX_CMD=${CLAUDE_HUB_CODEX_REVIEW_CMD:-$(dirname "$(readlink -f "$0")")/claude-peer-review}
+[ -x "$CODEX_CMD" ] || [ -n "${CLAUDE_HUB_CODEX_REVIEW_CMD:-}" ] || CODEX_CMD=$(command -v claude-peer-review)
+CODEX_STATE=${CLAUDE_HUB_CODEX_WEEK_STATE:-$HOME/.local/state/claude-hub/codex-week.json}
+CODEX_PID=''
+if [ -n "$CODEX_CMD" ] && [ -x "$CODEX_CMD" ]; then
+  "$CODEX_CMD" --check --save </dev/null >/dev/null 2>&1 &
+  CODEX_PID=$!
+fi
+
+REC=$(claude-autoswap recommend 2>/dev/null)
+[ -n "$REC" ] && is_paused "$REC" && REC=''     # a paused account is never the one to open on
+
+declare -A recheck_pid=() recheck_state=()
+recheck() {
+  local n=$1
+  is_paused "$n" && return 0                     # a paused account is not read again
+  [ -n "${recheck_pid[$n]:-}" ] && return 0      # one at a time per account
+  { fetch_usage "$n"; exit $?; } &
+  recheck_pid[$n]=$!
+  recheck_state[$n]=checking
+}
+reap_rechecks() {
+  local n
+  for n in "${!recheck_pid[@]}"; do
+    kill -0 "${recheck_pid[$n]}" 2>/dev/null && continue
+    wait "${recheck_pid[$n]}"
+    case $? in 0) recheck_state[$n]=ok ;; 2) recheck_state[$n]=busy ;; *) recheck_state[$n]=fail ;; esac
+    unset "recheck_pid[$n]"
+  done
+}
+
+pct_colour() {          # sets $_c — no subshell: draw runs every second
+  case $1 in
+    -|.|none) _c=$DIM ;;
+    *) if   [ "$1" -ge 90 ] 2>/dev/null; then _c=$RED
+       elif [ "$1" -ge 50 ] 2>/dev/null; then _c=$YELLOW
+       else _c=$GREEN; fi ;;
+  esac
+}
+
+clock_of() {
+  local ampm
+  _t=''
+  case $1 in
+    ''|.|-) return ;;
+    *[!0-9]*) _t=$1; return ;;
+  esac
+  if [ "$2" = long ]; then printf -v _t '%(%a %b %-d %-I:%M%p)T' "$1"
+  else printf -v _t '%(%-I:%M%p)T' "$1"; fi
+  ampm=${_t: -2}
+  _t=${_t%??}${ampm,,}
+}
+
+read_usage() {          # echoes six fields separated by | : s5 s5r wk wkr fb fbr
+  local f=$CACHE/usage-$1 live=$CACHE/live-$1.json
+  if [ -f "$live" ] && [ "$live" -nt "$f" ]; then
+    to_fields live "$(cat "$f" 2>/dev/null)" < "$live" > "$f.live" && mv "$f.live" "$f"
+  fi
+  [ -f "$f" ] && cat "$f" || echo ".|.|.|.|.|."
+}
+age_of() {              # "12m ago" for numbers older than two minutes, else nothing
+  local f=$CACHE/usage-$1 s
+  [ -f "$f" ] || return 0
+  s=$(( $(date +%s) - $(stat -c %Y "$f") ))
+  if   [ $s -ge 86400 ]; then echo "$((s / 86400))d ago"
+  elif [ $s -ge 3600 ];  then echo "$((s / 3600))h ago"
+  elif [ $s -ge 120 ];   then echo "$((s / 60))m ago"; fi
+}
+
+order=()
+while IFS=$'\t' read -r _g _t i; do order+=("$i"); done < <(
+  for i in "${!names[@]}"; do
+    if is_paused "${names[$i]}"; then printf '3\t0\t%s\n' "$i"; continue; fi
+    IFS='|' read -r _ _ _ wkr _ fbr <<< "$(read_usage "${names[$i]}")"
+    case $wkr in ''|*[!0-9]*) ;; *) [ "$wkr" -le "$EPOCHSECONDS" ] && wkr='' ;; esac
+    case $fbr in ''|*[!0-9]*) ;; *) [ "$fbr" -le "$EPOCHSECONDS" ] && fbr='' ;; esac
+    case $wkr in ''|.) wkr=$fbr ;; esac
+    case $wkr in ''|*[!0-9]*) g=2; t=0 ;; *) g=1; t=$wkr ;; esac
+    printf '%s\t%s\t%s\n' "$g" "$t" "$i"
+  done | sort -t$'\t' -k1,1n -k2,2n -k3,3n
+)
+sorted_names=(); sorted_mails=()
+for i in "${order[@]}"; do sorted_names+=("${names[$i]}"); sorted_mails+=("${mails[$i]}"); done
+names=("${sorted_names[@]}"); mails=("${sorted_mails[@]}")
+
+read_codex() {
+  python3 - "$CODEX_STATE" <<'PY' 2>/dev/null
+import json, math, os, stat, sys, time
+try:
+    if not stat.S_ISREG(os.stat(sys.argv[1]).st_mode):
+        sys.exit(0)                                   # a FIFO would hold the draw, and with it every key
+    d = json.load(open(sys.argv[1]))
+    at = float(d["at"])
+except Exception:
+    sys.exit(0)
+def num(v):                                           # a finite number, or None (NaN, Infinity, 1e400 too)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        return float(v) if math.isfinite(v) else None
+    except OverflowError:
+        return None
+line = d.get("line") if type(d.get("line")) is int else 95
+pct, resets = num(d.get("percent")), num(d.get("resets_at"))
+if pct is None:
+    out = ["-", "-", "can't be read now, Claudes review"]
+else:
+    try:
+        if resets is None:
+            raise ValueError                          # localtime(None) would be now
+        when = time.strftime("%a %-I:%M%p", time.localtime(resets)).replace("AM", "am").replace("PM", "pm")
+    except (OverflowError, OSError, ValueError):
+        when = "—"                                     # none, or past any calendar
+    what = f"reviews until {line}%" if pct < line else f"past {line}%, Claudes review"
+    out = [str(round(pct)), "r" if pct >= line else ("y" if pct >= 50 else "g"), f"{what} · resets {when}"]
+age = time.time() - at
+if age >= 86400: out[2] += f"  (from {int(age // 86400)}d ago)"
+elif age >= 3600: out[2] += f"  (from {int(age // 3600)}h ago)"
+elif age >= 120: out[2] += f"  (from {int(age // 60)}m ago)"
+acct = d.get("account")
+acct = "".join(c for c in acct if c.isprintable()) if isinstance(acct, str) else ""   # no escape reaches the terminal
+print("\x1f".join(out + [acct or "?"]))
+PY
+}
+
+draw() {
+  local f='' i n mark line part pad paused s5 s5r wk wkr fb fbr w5=0 ww=0 left any5='' c5
+  local -a P5=() PW=() PF=() T5=() TW=()
+  for i in "${!names[@]}"; do
+    if is_paused "${names[$i]}"; then              # a paused account's numbers and times are not shown, nor counted in the widths
+      P5[$i]=''; PW[$i]=''; PF[$i]=''; T5[$i]=''; TW[$i]=''
+      continue
+    fi
+    IFS='|' read -r s5 s5r wk wkr fb fbr <<< "$(read_usage "${names[$i]}")"
+    case $s5r in ''|*[!0-9]*) ;; *) [ "$s5" != none ] && [ "$s5r" -le "$EPOCHSECONDS" ] && { s5=0; s5r=''; } ;; esac
+    case $wkr in ''|*[!0-9]*) ;; *) [ "$wkr" -le "$EPOCHSECONDS" ] && { wk=0; wkr=''; } ;; esac
+    case $fbr in ''|*[!0-9]*) ;; *) [ "$fbr" -le "$EPOCHSECONDS" ] && { fb=0; fbr=''; } ;; esac
+    [ "$s5" = . ] && s5=-; [ "$wk" = . ] && wk=-; [ "$fb" = . ] && fb=-
+    P5[$i]=$s5; PW[$i]=$wk; PF[$i]=$fb
+    case $s5 in none) s5r='' ;; ''|*[!0-9]*) ;; *) any5=1 ;; esac    # a number keeps the 5h cell; none has no time
+    clock_of "$s5r" short; T5[$i]=$_t
+    [ ${#_t} -gt $w5 ] && w5=${#_t}
+    case $wkr in ''|.) wkr=$fbr ;; esac
+    clock_of "$wkr" long; TW[$i]=$_t
+    [ ${#_t} -gt $ww ] && ww=${#_t}
+  done
+  if [ -n "$any5" ]; then c5=$(( 11 + w5 )); else c5=0; fi
+  local cx cpct ccol cwhat cacct
+  cx=$(read_codex)
+  if [ -n "$cx" ]; then
+    IFS=$'\x1f' read -r cpct ccol cwhat cacct <<< "$cx"
+  else
+    cpct=-; ccol=-; cacct=''
+    if [ -n "$CODEX_PID" ] && kill -0 "$CODEX_PID" 2>/dev/null; then cwhat='reading…'; else cwhat='not read yet'; fi
+  fi
+  local email=1 short='' widest=0 bare=0 w b tail
+  for i in "${!names[@]}"; do
+    n=${names[$i]}; tail=0
+    [ -n "$REC" ] && [ "$n" = "$REC" ] && tail=$(( tail + 15 ))
+    [ -n "$CURRENT" ] && [ "$n" = "$CURRENT" ] && tail=$(( tail + 2 + ${#MARK} ))
+    is_paused "$n" && tail=$(( tail + 8 ))                    # "  paused"
+    case ${recheck_state[$n]:-} in busy) tail=$(( tail + 37 )) ;; fail) tail=$(( tail + 14 )) ;; esac
+    w=$(( 6 + nw + mw + c5 + 9 + 14 + ww + tail ))       # with its email
+    b=$(( 5 + nw + c5 + 9 + 14 + ww + tail ))            # without
+    [ "$w" -gt "$widest" ] && widest=$w
+    [ "$b" -gt "$bare" ] && bare=$b
+  done
+  w=$(( 16 + nw + mw + ${#cwhat} ))                         # the codex line, with its account
+  [ "$w" -gt "$widest" ] && widest=$w
+  if [ "$COLS" -gt 0 ] && [ "$widest" -gt "$COLS" ]; then
+    email=''
+    [ "$bare" -gt "$COLS" ] && short=1
+    w=$(( COLS - 15 - nw ))                                 # room for Codex's words without its account
+    [ "$w" -gt 1 ] && [ "${#cwhat}" -gt "$w" ] && cwhat="${cwhat:0:w-1}…"
+  fi
+  f+=$'\e[K\n'"  $BOLD$TITLE$OFF"$'\e[K\n\e[K\n'
+  for i in "${!names[@]}"; do
+    n=${names[$i]}
+    if [ -n "$CURRENT" ] && [ "$n" = "$CURRENT" ]; then mark='●'; else mark=' '; fi
+    paused=''; is_paused "$n" && paused=1
+    printf -v pad '%*s' "$(( nw - ${#n} > 0 ? nw - ${#n} : 0 ))" ''
+    if [ "$i" = "$sel" ]; then
+      if [ -n "$paused" ]; then
+        printf -v line '%2s %s %s%s%s%s%s%s' "$(( i + 1 ))" "$mark" "$REV$BOLD$STRIKE" "$n" "$OFF" "$REV$BOLD" "$pad" "$OFF"
+      else
+        printf -v line '%2s %s %s%-*s%s' "$(( i + 1 ))" "$mark" "$REV$BOLD" "$nw" "$n" "$OFF"
+      fi
+    elif [ -n "$paused" ]; then
+      printf -v line '%2s %s %s%s%s%s' "$(( i + 1 ))" "$mark" "$STRIKE" "$n" "$OFF" "$pad"
+    else
+      printf -v line '%2s %s %-*s' "$(( i + 1 ))" "$mark" "$nw" "$n"
+    fi
+    [ -n "$email" ] && { printf -v part ' %-*s' "$mw" "${mails[$i]}"; line+=$part; }
+    if [ -n "$paused" ]; then
+      printf -v part '%*s' "$(( c5 + 9 + 14 + ww ))" ''
+      line+=$part
+    else
+      if [ -z "$any5" ]; then :
+      elif [ "${P5[$i]}" = none ]; then
+        printf -v part '  %s5h none%s  %-*s' "$DIM" "$OFF" "$w5" ''       # seven columns, like `5h  12%`, and no time
+        line+=$part
+      else
+        pct_colour "${P5[$i]}"; printf -v part '  %s5h %3s%%%s  %-*s' "$_c" "${P5[$i]}" "$OFF" "$w5" "${T5[$i]}"
+        line+=$part
+      fi
+      pct_colour "${PW[$i]}"; printf -v part '  %swk %3s%%%s' "$_c" "${PW[$i]}" "$OFF"
+      line+=$part
+      pct_colour "${PF[$i]}"; printf -v part '  %sfable %3s%%%s  %-*s' "$_c" "${PF[$i]}" "$OFF" "$ww" "${TW[$i]}"
+      line+=$part
+    fi
+    if [ -n "$REC" ] && [ "$n" = "$REC" ]; then
+      if [ -n "$short" ]; then line+="  $CYAN★$OFF"; else line+="  $CYAN★ recommended$OFF"; fi
+    fi
+    [ -n "$CURRENT" ] && [ "$n" = "$CURRENT" ] && line+="  $DIM$MARK$OFF"
+    [ -n "$paused" ] && line+="  ${DIM}paused$OFF"
+    case ${recheck_state[$n]:-} in
+      checking) line+="  ${CYAN}checking…$OFF" ;;
+      ok)       line+="  $DIM✓ rechecked$OFF" ;;
+      busy)     if [ -n "$short" ]; then line+="  ${YELLOW}busy$OFF"
+                else line+="  ${YELLOW}server busy, try again in a few min$OFF"; fi ;;
+      fail)     line+="  ${RED}check failed$OFF" ;;
+    esac
+    f+=$line$'\e[K\n'
+  done
+  case $ccol in g) ccol=$GREEN ;; y) ccol=$YELLOW ;; r) ccol=$RED ;; *) ccol=$DIM ;; esac
+  if [ -n "$email" ]; then
+    printf -v line '     %s%-*s %-*s%s %swk %3s%%%s  %s%s%s' "$DIM" "$nw" codex "$mw" "$cacct" "$OFF" \
+      "$ccol" "$cpct" "$OFF" "$DIM" "$cwhat" "$OFF"
+  else
+    printf -v line '     %s%-*s%s %swk %3s%%%s  %s%s%s' "$DIM" "$nw" codex "$OFF" "$ccol" "$cpct" "$OFF" "$DIM" "$cwhat" "$OFF"
+  fi
+  if [ -n "$cx" ] || [ -n "$CODEX_PID" ]; then f+=$'\e[K\n'$line$'\e[K\n'; fi
+  local age
+  if is_paused "${names[$sel]}"; then            # no "numbers from" for an account with no subscription
+    f+=$'\e[K\n'"  $DIM${names[$sel]} is paused$OFF"$'\e[K\n'
+  else
+    age=$(age_of "${names[$sel]}")
+    f+=$'\e[K\n'"  $DIM${names[$sel]}${age:+:  numbers from $age}$OFF"$'\e[K\n'
+  fi
+  if [ -n "$note" ]; then
+    f+=$'\e[K\n'"  $note"$'\e[K\n'
+  fi
+  f+=$'\e[K\n'"  $DIM↑↓ or number move    enter pick    r recheck usage    q quit$OFF"$'\e[K\n'
+  printf '\e[H%s\e[J' "$f"
+}
+
+note=''
+
+typed=''
+numbered() { local t=$(( 10#$1 )); [ "$t" -ge 1 ] && [ "$t" -le ${#names[@]} ]; }
+pick_number() {
+  if numbered "$typed"; then sel=$(( 10#$typed - 1 )); note="${CYAN}number:$OFF $typed"
+  else note="${CYAN}number:$OFF $typed  ${DIM}nothing here is numbered $typed$OFF"; fi
+}
+
+read_key() {
+  local k rest
+  IFS= read -rsn1 -t "${1:-1}" k || { echo tick; return 0; }
+  if [ "$k" = "$ESC" ]; then
+    IFS= read -rsn2 -t 0.05 rest || rest=''
+    case $rest in '[A') echo up;; '[B') echo down;; '') echo quit;; *) echo other;; esac
+  elif [ -z "$k" ]; then echo enter
+  else echo "$k"; fi
+}
+
+sel=0
+for i in "${!names[@]}"; do [ "${names[$i]}" = "$CURRENT" ] && sel=$i; done
+
+trap 'printf "\e[?25h"; tput rmcup 2>/dev/null' EXIT
+tput smcup 2>/dev/null; printf '\e[?25l'
+COLS=0
+term_cols() { local IFS=$' \t\n' _r c; read -r _r c < <(stty size 2>/dev/null) && COLS=${c:-0}; }
+term_cols
+resized=''
+trap 'resized=1' WINCH
+while :; do
+  reap_rechecks
+  [ -n "$resized" ] && { resized=''; term_cols; }
+  draw
+  key=$(read_key "$([ ${#recheck_pid[@]} -gt 0 ] && echo 0.2 || echo 1)")
+  [ "$key" = tick ] && continue
+  note=''
+  was=$typed; typed=''                           # any key but a digit or Backspace drops the number
+  case $key in
+    [0-9])  typed=$was; [ ${#typed} -lt 3 ] && typed+=$key
+            pick_number ;;
+    $'\x7f'|$'\b') typed=${was%?}; [ -n "$typed" ] && pick_number ;;
+    up|k)   sel=$(( sel > 0 ? sel - 1 : ${#names[@]} - 1 )) ;;
+    down|j) sel=$(( (sel + 1) % ${#names[@]} )) ;;
+    enter)  if [ -n "$was" ] && ! numbered "$was"; then note="${DIM}nothing here is numbered $was$OFF"
+            elif is_paused "${names[$sel]}"; then note="$DIM${names[$sel]} is paused$OFF"
+            else echo "${names[$sel]}" > "$OUT"; echo "${names[$sel]}" > "$CACHE/last"; exit 0; fi ;;
+    r|R)    if is_paused "${names[$sel]}"; then note="$DIM${names[$sel]} is paused$OFF"; else recheck "${names[$sel]}"; fi ;;
+    quit)   [ -n "$was" ] || exit 1 ;;           # Esc drops a typed number first
+    q)      exit 1 ;;
+  esac
+done

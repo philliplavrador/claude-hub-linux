@@ -1,0 +1,28 @@
+#!/bin/sh
+
+name=$(basename "$0")
+args="$*"
+
+case "$args" in
+  *kglobalaccel*)
+    case "$args" in
+      *setShortcut*|*setForeignShortcut*|*setInactive*|*doRegister*|*unRegister*|\
+      *unregister*|*blockGlobalShortcuts*|*activateGlobalShortcutContext*|\
+      *yourShortcut*|*cleanUp*|*Properties.Set*)
+        echo "claude-hub: refusing '$name $args'." >&2
+        echo "claude-hub: a D-Bus write to org.kde.kglobalaccel aborts kwin_wayland (it owns that" >&2
+        echo "claude-hub: interface on Wayland) and leaves Meta+Q dead until a full re-login." >&2
+        echo "claude-hub: anything else: kwriteconfig6 on kglobalshortcutsrc, then log out and back in." >&2
+        printf '%s refused: %s %s\n' "$(date '+%F %T')" "$name" "$args" \
+          >> "${XDG_STATE_HOME:-$HOME/.local/state}/claude-hub/agent-screen.log" 2>/dev/null
+        exit 1
+        ;;
+    esac
+    ;;
+esac
+
+for d in /usr/bin /bin /usr/local/bin; do
+  [ -x "$d/$name" ] && exec "$d/$name" "$@"
+done
+echo "claude-hub: $name not found outside the agent shims" >&2
+exit 127

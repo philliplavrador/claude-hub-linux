@@ -1,0 +1,7 @@
+[Unit]
+Description=Type a name for the focused Claude window (Meta+Shift+N)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-console-retitle --type %i
+TimeoutStartSec=660

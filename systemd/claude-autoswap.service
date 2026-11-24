@@ -1,0 +1,13 @@
+[Unit]
+Description=Move each Claude to another subscription just before it hits a 5-hour, week or Fable limit
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/claude-autoswap run
+Restart=on-failure
+RestartSec=30
+Slice=background.slice
+
+[Install]
+WantedBy=graphical-session.target

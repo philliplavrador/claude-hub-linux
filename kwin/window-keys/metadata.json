@@ -1,0 +1,17 @@
+{
+    "KPlugin": {
+        "Id": "claude-window-keys",
+        "Name": "Claude hub window keys",
+        "Description": "A spare close key (Meta+Ctrl+Shift+Q) that survives a compositor restart, unlike KWin's own Meta+Q",
+        "Authors": [
+            {
+                "Name": "claude-hub-linux"
+            }
+        ],
+        "License": "MIT",
+        "Version": "1"
+    },
+    "KPackageStructure": "KWin/Script",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

@@ -1,0 +1,17 @@
+{
+    "KPlugin": {
+        "Id": "claude-console-retitle",
+        "Name": "Claude hub rename Claude window",
+        "Description": "Meta+N gives the focused Claude window a fresh name in its title bar",
+        "Authors": [
+            {
+                "Name": "claude-hub-linux"
+            }
+        ],
+        "License": "MIT",
+        "Version": "1"
+    },
+    "KPackageStructure": "KWin/Script",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

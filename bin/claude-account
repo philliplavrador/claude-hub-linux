@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+
+
+if [ -n "${CLAUDE_HUB_ACCOUNT_DISPLAY:-}" ]; then DISPLAY=$CLAUDE_HUB_ACCOUNT_DISPLAY
+fi
+export DISPLAY="${DISPLAY:-}"
+set -uo pipefail
+
+WINOVER=''; PICKARG=''
+while [ $# -gt 0 ]; do
+  case $1 in
+    --window) WINOVER=${2:-}; shift 2 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+    *) PICKARG=$1; shift ;;
+  esac
+done
+
+ACCTS=${CLAUDE_HUB_ACCOUNTS:-$HOME/.claude-accounts}
+RECORDS=${CLAUDE_HUB_WINDOWS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-hub/claude-windows}
+CACHE=$HOME/.cache/claude-hub-account
+CLAUDE_BIN=$(command -v claude)
+
+say()  { kdialog --title 'Claude account' --passivepopup "$1" "${2:-5}" >/dev/null 2>&1 & }
+die()  { say "$1" 6; exit 1; }
+
+if [ -n "$PICKARG" ] && [ -e "$ACCTS/$PICKARG/.claude-paused" ]; then die "$PICKARG is paused."; fi
+
+moved_popup() {
+  local l line='' kind='' reason='' extra=''
+  while IFS= read -r l; do
+    if [ -z "$line" ]; then
+      case $l in moved|moved:*|moved\;*) line=$l ;; esac
+    elif [[ $l == *[![:space:]]* ]]; then
+      l=${l#"${l%%[![:space:]]*}"}; l=${l%"${l##*[![:space:]]}"}       # no blanks at its ends
+      line+=" $l"
+    fi
+  done <<<"$1"
+  case $line in *"; woke: "*) kind=${line##*"; woke: "}; kind=${kind%%[[:space:]]*}; line=${line%"; woke: "*} ;; esac
+  case $line in "moved: "*) reason=${line#"moved: "}; reason=${reason%.} ;; esac
+  case $kind in
+    working|limit|background) extra=' It carries on where it stopped.' ;;
+    question) extra=' It asks its question again.' ;;
+    warned) extra=' It was told about the move.' ;;
+  esac
+  [ -n "$reason" ] && extra+=" Note: $reason."
+  popup="This window is on $pick now, same conversation.$extra"
+  popup_secs=5
+  [ -n "$extra" ] && popup_secs=7
+  return 0
+}
+
+if [ -n "$WINOVER" ]; then
+  kpid=$(xprop -id "$WINOVER" _NET_WM_PID 2>/dev/null | grep -oE '[0-9]+$')
+else
+  kpid=$("$HOME/.local/bin/claude-desks" active 2>/dev/null); rc=$?
+  [ "$rc" = 1 ] && die 'No window is focused.'
+fi
+[ -n "$kpid" ] || die 'That window does not say which program owns it.'
+[ "$(ps -o comm= -p "$kpid" 2>/dev/null)" = konsole ] ||
+  die 'claude-account works in a terminal window running Claude. This window is not one.'
+
+svc=org.kde.konsole-$kpid
+wobj=$(qdbus6 "$svc" 2>/dev/null | grep -m1 '^/Windows/')
+[ -n "$wobj" ] || die 'Cannot talk to this terminal.'
+sid=$(qdbus6 "$svc" "$wobj" org.kde.konsole.Window.currentSession 2>/dev/null)
+[ -n "$sid" ] || die 'Cannot find the tab in this terminal.'
+sobj=/Sessions/$sid
+shellpid=$(qdbus6 "$svc" "$sobj" org.kde.konsole.Session.processId 2>/dev/null)
+[ -n "$shellpid" ] || die 'Cannot find the shell in this tab.'
+
+send() { qdbus6 "$svc" "$sobj" org.kde.konsole.Session.sendText "$1" >/dev/null 2>&1; }
+
+find_claude() {
+  local queue=("$1") p k a
+  while [ ${#queue[@]} -gt 0 ]; do
+    p=${queue[0]}; queue=("${queue[@]:1}")
+    a=$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | head -1)
+    [ "${a##*/}" = claude ] && { echo "$p"; return 0; }
+    for k in $(pgrep -P "$p" 2>/dev/null); do queue+=("$k"); done
+  done
+  return 1
+}
+bgrec=$(python3 - "$RECORDS" "$shellpid" <<'PY' 2>/dev/null
+import glob, json, sys
+for f in sorted(glob.glob(sys.argv[1] + "/*.json")):
+    try:
+        r = json.load(open(f))
+    except Exception:
+        continue
+    if str(r.get("wrapper_pid")) == sys.argv[2]:
+        print(f)
+        break
+PY
+)
+if [ -n "$bgrec" ]; then
+  read -r bg_acct bg_id bg_sid < <(python3 -c '
+import json, re, sys
+try:
+    r = json.load(open(sys.argv[1]))
+    got = [r.get(k) for k in ("account", "id", "session_id")]
+    if all(isinstance(v, str) and re.fullmatch(r"[0-9A-Za-z._-]+", v) for v in got):
+        print(*got)
+except Exception:
+    pass' "$bgrec")
+  [ -n "$bg_sid" ] || die 'This window is still starting. Try again in a moment.'
+  cfg=$ACCTS/$bg_acct
+  cur=$bg_acct
+else
+  cpid=$(find_claude "$shellpid") ||
+    die 'No Claude is running in this window. Meta+Return opens one.'
+  tr '\0' ' ' < "/proc/$cpid/cmdline" 2>/dev/null | grep -q ' attach ' &&
+    die 'This window is still starting. Try again in a moment.'
+
+  cfg=$(tr '\0' '\n' < "/proc/$cpid/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -1)
+  [ -n "$cfg" ] || cfg=$(readlink -f "$HOME/.claude")
+  cfg=${cfg%/}
+  cur=$(basename "$cfg")
+fi
+
+email_of() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json,sys
+try:
+    j=json.load(open(sys.argv[1]+'/.claude.json'))
+    print(j.get('oauthAccount',{}).get('emailAddress',''))
+except Exception:
+    print('')
+PY
+}
+
+menu=(); n_all=0; others=0     # every account set up, and the ones offered besides the current one
+for d in "$ACCTS"/*/; do
+  [ -f "$d/.credentials.json" ] || continue
+  name=$(basename "$d")
+  n_all=$((n_all+1))
+  [ -e "$d/.claude-paused" ] && continue
+  mail=$(email_of "${d%/}")
+  label=$(printf '%-7s %s' "$name" "$mail")
+  [ "$name" = "$cur" ] && label="$label   ← now"
+  menu+=("$name" "$label")
+  [ "$name" = "$cur" ] || others=$((others+1))
+done
+[ "$n_all" -gt 1 ] || die 'Only one Claude account is set up on this machine.'
+[ "$others" -gt 0 ] || die 'No other Claude account to move to.'
+
+menu_in_window() {
+  local out new i
+  out=$(mktemp -t claude-account-XXXXXX)
+  new=$(qdbus6 "$svc" "$wobj" org.kde.konsole.Window.newSession 2>/dev/null) || return 3
+  [ -n "$new" ] || return 3
+  qdbus6 "$svc" "$wobj" org.kde.konsole.Window.setCurrentSession "$new" >/dev/null 2>&1
+  qdbus6 "$svc" "/Sessions/$new" org.kde.konsole.Session.setTitle 1 'Claude account' >/dev/null 2>&1
+  qdbus6 "$svc" "/Sessions/$new" org.kde.konsole.Session.runCommand \
+    "exec claude-account-menu --out $out --current $cur --title 'Switch this window to which account?'" \
+    >/dev/null 2>&1
+  for i in $(seq 1 1200); do
+    qdbus6 "$svc" "$wobj" org.kde.konsole.Window.sessionList 2>/dev/null | grep -qx "$new" || break
+    sleep 0.5
+  done
+  local p=''; [ -f "$out" ] && p=$(cat "$out")
+  rm -f "$out"
+  [ -n "$p" ] || return 1
+  echo "$p"
+}
+
+if [ -n "$PICKARG" ]; then
+  pick=$PICKARG
+else
+  pick=$(menu_in_window); rc=$?
+  if [ "$rc" = 3 ]; then
+    pick=$(kdialog --title 'Claude account' --default "$cur" \
+           --menu "This window is signed in as $cur.  Switch it to:" "${menu[@]}" 2>/dev/null)
+  elif [ "$rc" != 0 ]; then
+    exit 0
+  fi
+fi
+[ -n "$pick" ] || exit 0
+[ "$pick" != "$cur" ] || exit 0
+[ -d "$ACCTS/$pick" ] || die "No account called $pick."
+[ -e "$ACCTS/$pick/.claude-paused" ] && die "$pick is paused."   # a hand pause (the menu leaves it out; belt and braces)
+
+if [ -n "$bgrec" ]; then
+  say "Switching this window to $pick …" 3
+  out=$(claude-move "$bg_sid" "$pick" --force --wake 2>&1)
+  if [ $? = 0 ]; then
+    title=$(qdbus6 "$svc" "$sobj" org.kde.konsole.Session.title 1 2>/dev/null)
+    for a in "$ACCTS"/*/; do title=${title#"$(basename "$a")" · }; done
+    qdbus6 "$svc" "$sobj" org.kde.konsole.Session.setTitle 1 "$pick · $title" >/dev/null 2>&1
+    moved_popup "$out"
+    say "$popup" "$popup_secs"
+  else
+    die "$out"
+  fi
+  exit 0
+fi
+
+key=$(printf '%s%s' "$(qdbus6 org.freedesktop.DBus / org.freedesktop.DBus.GetNameOwner "$svc" 2>/dev/null)" "$sobj" | tr -c 'a-zA-Z0-9' '_')
+sess=''; tpath=''
+if [ -f "$CACHE/$key" ]; then
+  read -r sess tpath < <(python3 - "$CACHE/$key" <<'PY' 2>/dev/null
+import json,sys
+try:
+    j=json.load(open(sys.argv[1])); print(j.get('session_id',''), j.get('transcript_path',''))
+except Exception: print('', '')
+PY
+)
+fi
+[ -n "$tpath" ] && tpath=$(readlink -f "$tpath" 2>/dev/null)
+case "$tpath" in "$cfg"/*) : ;; *) sess=''; tpath='' ;; esac
+[ -f "$tpath" ] || { sess=''; tpath=''; }
+
+if [ -z "$sess" ]; then
+  sess=$(python3 - "$cfg" "$cpid" <<'PY' 2>/dev/null
+import glob, json, os, re, sys
+cfg, pid = sys.argv[1:3]
+try:
+    sid = json.load(open(os.path.join(cfg, "sessions", pid + ".json"))).get("sessionId")
+except (OSError, ValueError, AttributeError):
+    sid = None
+if isinstance(sid, str) and re.fullmatch(r"[0-9A-Za-z-]+", sid) \
+        and glob.glob(os.path.join(glob.escape(cfg), "projects", "*", sid + ".jsonl")):
+    print(sid)
+PY
+)
+fi
+
+if [ -n "$sess" ]; then
+  say "Switching this window to $pick …" 3
+  out=$(claude-move "$sess" "$pick" --force --wake 2>&1)
+  if [ $? = 0 ]; then
+    title=$(qdbus6 "$svc" "$sobj" org.kde.konsole.Session.title 1 2>/dev/null)
+    for a in "$ACCTS"/*/; do title=${title#"$(basename "$a")" · }; done
+    qdbus6 "$svc" "$sobj" org.kde.konsole.Session.setTitle 1 "$pick · $title" >/dev/null 2>&1
+    moved_popup "$out"
+    say "$popup" "$popup_secs"
+    exit 0
+  fi
+  die "$out"
+fi
+
+flags=(); skip=0
+while IFS= read -r -d '' a; do
+  [ "$skip" = 1 ] && { skip=0; continue; }
+  case "$a" in
+    --resume|-r) skip=1; continue ;;
+    --continue|-c) continue ;;
+    *) flags+=("$a") ;;
+  esac
+done < "/proc/$cpid/cmdline"
+flags=("${flags[@]:1}")   # drop argv[0]
+
+say "Switching this window to $pick …" 3
+send $'\003'; sleep 0.5          # stop whatever it is doing
+send $'\003'; sleep 0.3          # clear the prompt line
+send $'/exit\r'
+gone=0
+for _ in $(seq 1 40); do kill -0 "$cpid" 2>/dev/null || { gone=1; break; }; sleep 0.25; done
+if [ "$gone" = 0 ]; then
+  send $'\004'                   # ctrl-D
+  for _ in $(seq 1 20); do kill -0 "$cpid" 2>/dev/null || { gone=1; break; }; sleep 0.25; done
+fi
+if [ "$gone" = 0 ]; then
+  kill -TERM "$cpid" 2>/dev/null
+  for _ in $(seq 1 20); do kill -0 "$cpid" 2>/dev/null || { gone=1; break; }; sleep 0.25; done
+fi
+[ "$gone" = 1 ] || die "Claude would not close, so nothing was changed. Close it yourself, then try again."
+sleep 0.8                        # let the shell finish drawing its prompt
+
+resume=()
+if [ -n "$tpath" ] && [ -f "$tpath" ]; then
+  slug=$(basename "$(dirname "$tpath")")
+  if mkdir -p "$ACCTS/$pick/projects/$slug" && cp -f "$tpath" "$ACCTS/$pick/projects/$slug/"; then
+    resume=(--resume "$sess")
+  fi
+fi
+
+cmd="CLAUDE_CONFIG_DIR=$ACCTS/$pick $CLAUDE_BIN"
+for f in "${flags[@]}"; do cmd+=" $(printf '%q' "$f")"; done
+for f in "${resume[@]}"; do cmd+=" $(printf '%q' "$f")"; done
+send "$cmd"$'\r'
+
+title=$(qdbus6 "$svc" "$sobj" org.kde.konsole.Session.title 1 2>/dev/null)
+for a in "$ACCTS"/*/; do title=${title#"$(basename "$a")" · }; done
+qdbus6 "$svc" "$sobj" org.kde.konsole.Session.setTitle 1 "$pick · $title" >/dev/null 2>&1
+
+if [ ${#resume[@]} -gt 0 ]; then
+  say "This window is on $pick now, same conversation." 5
+else
+  say "This window is on $pick now. It started a fresh chat — the old one stayed on $cur." 7
+fi

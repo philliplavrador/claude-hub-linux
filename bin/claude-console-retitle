@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFileSync, spawnSync } = require('child_process');
+const { recordsDir } = require(path.join(path.dirname(fs.realpathSync(__filename)), 'lib', 'claude-tab.js'));
+
+const env = process.env;
+const BIN = path.join(os.homedir(), '.local', 'bin');
+const QDBUS = env.CLAUDE_HUB_RETITLE_QDBUS || 'qdbus6';
+const NAMER = env.CLAUDE_HUB_RETITLE_NAMER || path.join(path.dirname(fs.realpathSync(__filename)), 'claude-title');
+const ASK = env.CLAUDE_HUB_RETITLE_ASK || '';
+const HINT = 'Shown in the hub and on its title bar. Meta+N lets the model write one.';
+const STRIP = env.CLAUDE_HUB_RETITLE_STRIP || path.join(BIN, 'claude-console-strip');
+const NOTIFY = env.CLAUDE_HUB_RETITLE_NOTIFY || 'notify-send';
+const ACCTS = env.CLAUDE_HUB_ACCOUNTS || path.join(os.homedir(), '.claude-accounts');
+
+const NAMER_MS = 135000;
+
+function log(msg) { process.stderr.write(`claude-console-retitle: ${msg}\n`); }
+
+function say(msg) {
+  log(msg);
+  spawnSync(NOTIFY, ['-a', 'Claude window', '-t', '3000', msg], { stdio: 'ignore', timeout: 5000 });
+}
+
+function q(...args) {
+  try { return execFileSync(QDBUS, args, { encoding: 'utf8', timeout: 3000 }).trim(); } catch { return null; }
+}
+
+function comm(pid) {
+  try { return fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim(); } catch { return ''; }
+}
+
+const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+
+function currentTab(svc) {
+  const objects = (q(svc) || '').split('\n');
+  const windows = objects.filter((o) => /^\/Windows\/\d+$/.test(o));
+  const sessionOf = (w) => {
+    const n = q(svc, w, 'org.kde.konsole.Window.currentSession');
+    return n && /^\d+$/.test(n) ? `/Sessions/${n}` : null;
+  };
+  if (windows.length <= 1) return windows.length ? sessionOf(windows[0]) : null;
+
+  const active = objects.filter((o) => /^\/konsole\/MainWindow_\d+$/.test(o))
+    .find((m) => q(svc, m, 'org.qtproject.Qt.QWidget.isActiveWindow') === 'true');
+  if (!active) return null;
+  const shown = norm(q(svc, active, 'org.qtproject.Qt.QWidget.windowTitle'));
+  const matches = windows.filter((w) => {
+    const ses = sessionOf(w);
+    return ses && norm(q(svc, ses, 'org.kde.konsole.Session.title', '1')) === shown;
+  });
+  if (matches.length === 1) return sessionOf(matches[0]);
+  const same = `/Windows/${active.split('_').pop()}`;
+  return (matches.length ? matches : windows).includes(same) ? sessionOf(same) : null;
+}
+
+
+function fromRecord(names, ses) {
+  let best = null;
+  let files = [];
+  try { files = fs.readdirSync(recordsDir(env)).filter((f) => f.endsWith('.json')); } catch {}
+  for (const f of files) {
+    let r;
+    try { r = JSON.parse(fs.readFileSync(path.join(recordsDir(env), f), 'utf8')); } catch { continue; }
+    if (r.konsole_session !== ses || !names.includes(r.konsole_service) || !r.account) continue;
+    if (!best || (r.attached_at || 0) > (best.attached_at || 0)) best = r;
+  }
+  return best ? { account: best.account, sid: best.session_id || best.id } : null;
+}
+
+function fromProcess(root) {
+  const kids = new Map();
+  for (const d of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(d)) continue;
+    let stat;
+    try { stat = fs.readFileSync(`/proc/${d}/stat`, 'utf8'); } catch { continue; }
+    const ppid = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
+    if (!kids.has(ppid)) kids.set(ppid, []);
+    kids.get(ppid).push(d);
+  }
+  const queue = [String(root)];
+  for (let i = 0; i < queue.length && i < 500; i++) {
+    const pid = queue[i];
+    if (comm(pid) === 'claude') {
+      let dir = '';
+      try {
+        const vars = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+        dir = (vars.find((v) => v.startsWith('CLAUDE_CONFIG_DIR=')) || '').slice(18);
+      } catch {}
+      if (!dir) try { dir = fs.realpathSync(path.join(os.homedir(), '.claude')); } catch {}
+      try {
+        const s = JSON.parse(fs.readFileSync(path.join(dir, 'sessions', `${pid}.json`), 'utf8'));
+        if (s.sessionId) return { account: path.basename(dir), sid: s.sessionId };
+      } catch { /* `claude attach` and the like have no session file of their own */ }
+    }
+    queue.push(...(kids.get(pid) || []));
+  }
+  return null;
+}
+
+function transcriptOf(account, sid) {
+  const projects = path.join(ACCTS, account, 'projects');
+  let dirs = [];
+  try { dirs = fs.readdirSync(projects); } catch {}
+  for (const d of dirs) {
+    const f = path.join(projects, d, `${sid}.jsonl`);
+    if (fs.existsSync(f)) return f;
+  }
+  return '';
+}
+
+
+function typeIt(found) {
+  const now = spawnSync(NAMER, ['get', found.sid], { encoding: 'utf8', timeout: 10000 });
+  const current = now.status === 0 ? norm(String(now.stdout || '').split('\n')[0]) : '';
+  if (!ASK) return { said: 'No name box is set up (CLAUDE_HUB_RETITLE_ASK names its command)' };
+  const asked = spawnSync(ASK, ['ask', '--title', 'Name this Claude', '--value', current, '--hint', HINT],
+    { encoding: 'utf8', timeout: 600000 });
+  if (asked.status === 1) return { left: true };
+  if (asked.status !== 0) return { said: 'Could not open the name box' };
+  const typed = norm(String(asked.stdout || '').split('\n')[0]);
+  if (!typed) return { left: true };
+  const kept = spawnSync(NAMER, ['set', found.account, found.sid, typed], { encoding: 'utf8', timeout: 30000 });
+  const title = kept.status === 0 ? norm(String(kept.stdout || '').split('\n')[0]) : '';
+  return title ? { title } : { said: 'That name cannot be used' };
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  const typed = args.includes('--type');
+  const pid = args.filter((a) => !a.startsWith('--'))[0] || '';
+  if (!/^\d+$/.test(pid)) { log('usage: claude-console-retitle [--type] <window pid>'); return 2; }
+  if (comm(pid) !== 'konsole') { say('Not a Claude window'); return 0; }
+
+  const svc = `org.kde.konsole-${pid}`;
+  const ses = currentTab(svc);
+  if (!ses) { say('Could not tell which Konsole window is in front'); return 1; }
+  const unique = q('org.freedesktop.DBus', '/', 'org.freedesktop.DBus.GetNameOwner', svc);
+  const tabSvc = unique || svc;
+
+  const root = q(svc, ses, 'org.kde.konsole.Session.processId');
+  const found = fromRecord([svc, unique].filter(Boolean), ses) || (root && /^\d+$/.test(root) ? fromProcess(root) : null);
+  if (!found) { say('Not a Claude window'); return 0; }
+
+  let title = '';
+  if (typed) {
+    const mine = typeIt(found);
+    if (mine.left) { log(`${found.sid}: he left the name box`); return 0; }
+    if (mine.said) { say(mine.said); return 1; }
+    title = mine.title;
+  } else {
+    const transcript = transcriptOf(found.account, found.sid);
+    if (!transcript) { say('This Claude has nothing to name yet'); return 1; }
+
+    const res = spawnSync(NAMER, ['rename', found.account, found.sid],
+      { encoding: 'utf8', timeout: NAMER_MS });
+    title = res.status === 0 ? norm(String(res.stdout || '').split('\n')[0]) : '';
+    if (!title) { say('Could not come up with a name — try again in a moment'); return 1; }
+  }
+
+  const before = q(svc, ses, 'org.kde.konsole.Session.title', '1');
+  const wrote = spawnSync(STRIP, ['retitle', found.sid, tabSvc, ses, title], { stdio: 'ignore', timeout: 15000 });
+  if (wrote.status !== 0) { say('Could not rename this window'); return 1; }
+  if (!typed && before != null && norm(before) === norm(q(svc, ses, 'org.kde.konsole.Session.title', '1'))) {
+    say(`Still the best name: ${title}`);
+  }
+  log(`${found.sid} (${found.account}) on ${tabSvc} ${ses}: ${title}`);
+  return 0;
+}
+
+process.exit(main());

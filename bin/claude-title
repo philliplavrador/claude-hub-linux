@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""claude-title: what each Claude is for, in a few plain words.
+
+The hub names every Claude with Claude Code's own name for it, which is written from the session's opening lines.
+Sessions that open with /model and /effort end up named after those. Here a small model reads what you asked in the
+session, never what the harness said in your channel, and writes the name. It is written again when you ask for
+something new, with the old name in hand so a name that still fits is kept word for word. claude-desks shows it
+wherever it showed Claude Code's name (the hub's rows, the desktops' names); with no written name, Claude Code's stays.
+
+  claude-title refresh <account> <session-id>
+                                  bring that session's name up to date: read what was added to its
+                                  transcript, and ask a model when you have asked something new. One
+                                  line says what happened. Exit 0 whatever the model did: a name is
+                                  never worth failing anything over
+  claude-title rename <account> <session-id>
+                                  the rename shortcut (claude-console-retitle): you pressed it because
+                                  the name does not fit, so a model is asked now, and afresh, without
+                                  being shown the current name. Prints the new name and nothing else;
+                                  exit 1 and nothing printed when there is none, and the old one stays
+  claude-title set <account> <session-id> <name>
+                                  type your own title: the name you typed, word for word. No model is
+                                  asked then or afterwards; it stays, whatever you ask that Claude
+                                  next, until you press the rename shortcut. Prints the name; exit 1
+                                  and nothing printed when it cannot be drawn (control characters,
+                                  several lines, under 3 or over 80 characters), and the old name stays
+  claude-title get <session-id>
+                                  the written name; exit 1 and nothing printed when there is none
+  claude-title list               every session that has been looked at: its name, who wrote it,
+                                  how many things you asked, and what went wrong the last time
+
+The model is Haiku on the session's own subscription (about 1,100 tokens a name); when that gives no name (the
+account is at its limit, the machine is offline) a local Ollama on this machine is asked instead (gemma3:4b, free,
+and vaguer). What either says is held to the same rules before it is ever drawn, and what fails them lands in a named
+bucket: in the log line (~/.cache/claude-console/titles.log for the namings the desktop service starts), and in the
+session's state for `list`.
+
+A restart resumes a Claude under a new session id, and its window record keeps the earlier ids (`lineage`, newest
+first). tick() is handed the lineage with each session; one that has no name takes the first earlier id's (inherit):
+the name, who wrote it, what was counted, with the new transcript read from its end, so a name you typed survives the
+restart and nothing in the resumed transcript counts as something new you asked. A session with a name is never
+touched. A background session that is listed before its window record exists is not named by a model for its first
+30 s.
+
+A session's state is ~/.cache/claude-console/<session-id>.title.json, rewritten atomically under a lock of its own
+(<session-id>.title.lock):
+  {"title", "by": "haiku" | "local" | "him", "at": <epoch>, "titled": <`count` when it was written>,
+   "account", "transcript": <path>, "looked": <epoch the path was last searched for>,
+   "offset": <bytes of the transcript read so far>, "count": <the requests of yours that say what the
+   work is>, "first": [the first 3 of them], "last": [the last 5],
+   "tried": <epoch of the last question to a model>, "failed": <questions in a row that gave no
+   name>, "rejected": <the bucket the last of those landed in>}
+
+Test switches: CLAUDE_HUB_CONSOLE_CACHE, CLAUDE_HUB_ACCOUNTS, CLAUDE_HUB_TITLE_OLLAMA (the local model's URL;
+"off": never asked), CLAUDE_HUB_TITLE_LOCAL_MODEL, CLAUDE_HUB_TITLE_TIMEOUT_WRAPPER (the claude-timeout file;
+default: the one beside this file).
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from pathlib import Path
+
+ME = Path(__file__).resolve()
+CACHE = Path(os.environ.get("CLAUDE_HUB_CONSOLE_CACHE") or Path.home() / ".cache" / "claude-console")
+ACCTS = Path(os.environ.get("CLAUDE_HUB_ACCOUNTS") or str(Path.home() / ".claude-accounts"))
+WORK = CACHE / "title-work"
+LOG = CACHE / "titles.log"
+STRIP = Path(os.environ.get("CLAUDE_HUB_TITLE_STRIP") or ME.parent / "claude-console-strip")
+OLLAMA = os.environ.get("CLAUDE_HUB_TITLE_OLLAMA") or "http://127.0.0.1:11434/api/generate"
+LOCAL_MODEL = os.environ.get("CLAUDE_HUB_TITLE_LOCAL_MODEL") or "gemma3:4b"
+
+FIRST, LAST = 3, 5
+ASK_CHARS = 600
+NAME_CHARS, NAME_WORDS = 64, 9
+RELOOK = 60.0
+RELOOK_NONE = 10.0
+RETRY, RETRY_MOST = 60.0, 3600.0
+
+RULES = ("You name work sessions for their owner, who scans a list of them to find the one he wants. "
+         "You are given what he typed into ONE session, oldest first. Reply with ONLY the name: 3 to 6 "
+         "plain words saying what the session is for, leading with the thing being worked on. Sentence "
+         "case; copy product names and acronyms the way he spelled them. No quotes, no full stop, no jargon, and never the words session or "
+         "task. Name the goal, not the steps or the tools used to reach it.")
+
+CLAUDE_ARGS = ["-p", "--model", "haiku", "--setting-sources", "",
+               "--no-session-persistence", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+               "--disable-slash-commands", "--tools", "", "--output-format", "json",
+               "--system-prompt", RULES]
+CLAUDE_WAIT, LOCAL_WAIT, STRIP_WAIT = 40, 15, 15
+TIMEOUT_WRAPPER = Path(os.environ.get("CLAUDE_HUB_TITLE_TIMEOUT_WRAPPER") or ME.parent / "claude-timeout")
+BACKSTOP = 55
+CANCEL_WAIT = 55
+
+
+def note(sid: str, text: str) -> None:
+    print(f"claude-title: {sid[:8]} {text}", file=sys.stderr, flush=True)
+
+
+def clean_sid(sid) -> str:
+    return re.sub(r"[^a-zA-Z0-9-]", "", str(sid or ""))
+
+
+
+IMAGE_MARK = re.compile(r"\[Image #\d+\]\s*")
+NOT_HIM = re.compile(
+    r"^(?:<[a-z]+(?:-[a-z]+)+>|/[a-z][\w:-]*(?:\s|$)|\[Request interrupted|\[Image: |\[Cross-session|"
+    r"Stop hook feedback|Base directory for this skill|Your response above was stopped|"
+    r"This session is being continued|Continue from where you left off|Another Claude session sent|"
+    r"The computer restarted and this session was resumed)")
+NUDGE = re.compile(
+    r"^(?:resume|continue|keep going|go on|go ahead|proceed|carry on|where (?:were|are) we|"
+    r"what(?:'s| is) next|status|yes|yep|yeah|no|nope|ok(?:ay)?|sure|please|thanks?(?: you)?|do it|"
+    r"try again)\b[\s,.!?;:-]*", re.I)
+
+
+def his_words(record) -> str:
+    if not isinstance(record, dict) or record.get("type") != "user":
+        return ""
+    if record.get("isMeta") or record.get("isSidechain") or record.get("isCompactSummary"):
+        return ""
+    origin = record.get("origin")
+    kind = origin.get("kind") if isinstance(origin, dict) else None
+    turn = record.get("turnOrigin")
+    if (kind is not None and kind != "human") or (kind is None and turn is not None and turn != "human"):
+        return ""
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        parts = [content]
+    elif isinstance(content, list):
+        parts = [str(c.get("text") or "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+    else:
+        parts = []
+    text = IMAGE_MARK.sub("", " ".join(" ".join(parts).split())).strip()
+    return "" if not text or NOT_HIM.match(text) else text
+
+
+def asks_in(lines) -> list[str]:
+    out = []
+    for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", "replace")
+        if '"type":"user"' not in line and '"type": "user"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        text = his_words(record)
+        if text:
+            out.append(text)
+    return out
+
+
+def carries_topic(ask: str) -> bool:
+    ask = str(ask or "")
+    if len(ask.split()) < 3 or len(ask) < 12:
+        return False
+    rest = ask
+    while rest and NUDGE.match(rest):
+        rest = rest[NUDGE.match(rest).end():]
+    return bool(rest.strip())
+
+
+def scan(st: dict, path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    moved = st.get("transcript") != str(path)
+    offset = 0 if moved else int(st.get("offset") or 0)
+    if moved or size < offset:
+        was = int(st.get("count") or 0)
+        st.update(transcript=str(path), offset=0, count=0, first=[], last=[], size=0)
+        offset = 0
+    else:
+        was = None
+    if size == offset or (not moved and size == int(st.get("size") or 0)):
+        return moved
+    st["size"] = size
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read(size - offset)
+    except OSError:
+        return moved
+    whole = chunk[: chunk.rfind(b"\n") + 1]
+    first, last = list(st.get("first") or []), list(st.get("last") or [])
+    count = int(st.get("count") or 0)
+    for ask in asks_in(whole.split(b"\n")):
+        if not carries_topic(ask):
+            continue
+        ask = ask[:ASK_CHARS]
+        count += 1
+        if len(first) < FIRST:
+            first.append(ask)
+        last = (last + [ask])[-LAST:]
+    st.update(offset=offset + len(whole), count=count, first=first, last=last)
+    if was is not None and "titled" in st:
+        st["titled"] = min(int(st["titled"]), max(count, 0)) if count < was else st["titled"]
+    return bool(whole) or moved
+
+
+def picked(st: dict) -> list[str]:
+    first, last = list(st.get("first") or []), list(st.get("last") or [])
+    rest = max(0, min(len(last), int(st.get("count") or 0) - len(first)))
+    return first + (last[-rest:] if rest else [])
+
+
+def due(st: dict, now: float | None = None) -> bool:
+    count = int(st.get("count") or 0)
+    if not count:
+        return False
+    if st.get("title") and st.get("by") == "him":
+        return False
+    if st.get("title") and int(st.get("titled") or 0) >= count:
+        return False
+    failed = int(st.get("failed") or 0)
+    if failed:
+        wait = min(RETRY_MOST, RETRY * 2 ** min(failed - 1, 10))
+        since = (time.time() if now is None else now) - float(st.get("tried") or 0)
+        if 0 <= since < wait:
+            return False
+    return True
+
+
+
+REFUSAL = re.compile(r"\b(?:I cannot|I can't|I can not|I'm unable|I am unable|I don't have|I do not have|"
+                     r"as an AI|sorry)\b", re.I)
+NON_ANSWER = re.compile(r"^(?:unknown|unclear|unspecified|undetermined|untitled|no (?:clear |specific )?"
+                        r"(?:topic|request|goal|focus|name)|not enough|insufficient|n/a\b|none\b)", re.I)
+
+
+def classify(raw) -> tuple[str, str]:
+    if raw is None:
+        return "", "empty"
+    if not isinstance(raw, str):
+        return "", "not-text"
+    s = raw.strip(" \t\r\n")
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Co", "Cn") and c not in "\n\t" for c in s):
+        return "", "control-characters"
+    if any(c == "\n" or unicodedata.category(c) in ("Zl", "Zp") for c in s):
+        return "", "several-lines"
+    s = " ".join(s.split())
+    s = re.sub(r"^(?:title|name|label|summary)\s*:\s*", "", s, flags=re.I)
+    s = s.strip("\"'`").strip()
+    s = re.sub(r"\s*\.+$", "", s)
+    if len(s) < 3:
+        return "", "empty"
+    if REFUSAL.search(s):
+        return "", "refusal"
+    if NON_ANSWER.match(s):
+        return "", "non-answer"
+    if len(s) > NAME_CHARS or len(s.split()) > NAME_WORDS:
+        return "", "runaway"
+    return s[0].upper() + s[1:], ""
+
+
+SECOND_LOOK = ("Reply with its name now, exactly as it is, if that still covers what he is asking for. Only if "
+               "his most recent request is about different work, reply with a new name for that different work.")
+THINK = 1024
+
+
+HIS_CHARS = 80
+
+
+def classify_his(raw) -> tuple[str, str]:
+    if not isinstance(raw, str):
+        return "", "empty" if raw is None else "not-text"
+    s = raw.strip(" \t\r\n")
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Co", "Cn") and c not in "\n\t" for c in s):
+        return "", "control-characters"
+    if any(c == "\n" or unicodedata.category(c) in ("Zl", "Zp") for c in s):
+        return "", "several-lines"
+    s = " ".join(s.split())
+    if len(s) < 3:
+        return "", "empty"
+    if len(s) > HIS_CHARS:
+        return "", "too-long"
+    return s, ""
+
+
+def question(st: dict) -> str:
+    asked = ["WHAT HE ASKED, OLDEST FIRST:", *[f"- {ask}" for ask in picked(st)]]
+    if not st.get("title"):
+        return "\n".join(asked)
+    return "\n".join([f"ITS NAME NOW: {st['title']}", "", *asked, "", SECOND_LOOK])
+
+
+def claude_env(account: str, think: int = THINK) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith("CLAUDE") or k.startswith("KONSOLE_DBUS") or k.startswith("ANTHROPIC"))}
+    env["CLAUDE_CONFIG_DIR"] = str(ACCTS / account)
+    env["MAX_THINKING_TOKENS"] = str(int(think))
+    return env
+
+
+def stop_wrapper(proc: subprocess.Popen) -> None:
+    try:
+        os.kill(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=CANCEL_WAIT)
+        return
+    except (OSError, subprocess.SubprocessError):
+        pass
+    except BaseException:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def run_claude(prompt: str, env: dict) -> subprocess.CompletedProcess:
+    cmd = ["claude", *CLAUDE_ARGS]
+    wrapper = TIMEOUT_WRAPPER if os.path.isfile(TIMEOUT_WRAPPER) and os.access(TIMEOUT_WRAPPER, os.X_OK) else None
+    if wrapper is None:
+        return subprocess.run(cmd, input=prompt, env=env, cwd=str(WORK), capture_output=True, text=True,
+                              timeout=CLAUDE_WAIT)
+    wrapped = [str(wrapper), str(CLAUDE_WAIT), "--", *cmd]
+    with subprocess.Popen(wrapped, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                          env=env, cwd=str(WORK), start_new_session=True) as proc:
+        try:
+            out, err = proc.communicate(prompt, timeout=CLAUDE_WAIT + BACKSTOP)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.communicate()
+            raise subprocess.TimeoutExpired(cmd, CLAUDE_WAIT)
+        except BaseException:
+            stop_wrapper(proc)
+            raise
+    if proc.returncode == 124:
+        raise subprocess.TimeoutExpired(cmd, CLAUDE_WAIT)
+    return subprocess.CompletedProcess(wrapped, proc.returncode, out, err)
+
+
+def ask_haiku(account: str, prompt: str, think: int = THINK) -> tuple[str, str, str]:
+    try:
+        WORK.mkdir(parents=True, exist_ok=True)
+        res = run_claude(prompt, claude_env(account, think))
+    except (OSError, subprocess.SubprocessError) as err:
+        return "", "cli-failed", str(err)
+    said = res.stdout.strip()
+    if res.returncode != 0:
+        return "", "cli-failed", f"exit {res.returncode}: {(res.stderr.strip() or said)}"
+    if not said:
+        return "", "cli-silent", res.stderr.strip()
+    try:
+        out = json.loads(said)
+    except ValueError:
+        out = None
+    if not isinstance(out, dict):
+        return "", "cli-unparseable", said
+    if out.get("is_error"):
+        return "", "cli-error", str(out.get("result") or out.get("subtype") or "")
+    name, bucket = classify(out.get("result"))
+    return name, bucket, str(out.get("result"))
+
+
+def ask_local(prompt: str) -> tuple[str, str, str]:
+    if OLLAMA == "off":
+        return "", "local-off", ""
+    body = json.dumps({"model": LOCAL_MODEL, "prompt": f"{RULES}\n\n{prompt}", "stream": False, "think": False,
+                       "options": {"temperature": 0.2, "num_predict": 48}}).encode()
+    req = urllib.request.Request(OLLAMA, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=LOCAL_WAIT) as r:
+            said = r.read().decode("utf-8", "replace")
+    except (OSError, urllib.error.URLError, ValueError) as err:
+        return "", "local-unreachable", str(err)
+    try:
+        out = json.loads(said)
+    except ValueError:
+        out = None
+    if not isinstance(out, dict):
+        return "", "local-unparseable", said
+    name, bucket = classify(out.get("response"))
+    return name, bucket, str(out.get("response"))
+
+
+
+def state_file(sid: str) -> Path:
+    return CACHE / f"{sid}.title.json"
+
+
+def read_state(sid: str) -> dict:
+    try:
+        data = json.loads(state_file(sid).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_state(sid: str, st: dict) -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE / f".{sid}.title.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(st))
+    os.replace(tmp, state_file(sid))
+
+
+@contextmanager
+def lock(sid: str, wait: bool = True):
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(CACHE / f"{sid}.title.lock", "a+") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def inherit_locked(sid: str, st: dict, older_ids) -> bool:
+    if st.get("title"):
+        return False
+    for old in older_ids or []:
+        old = clean_sid(old)
+        if not old or old == sid:
+            continue
+        was = read_state(old)
+        if not was.get("title"):
+            continue
+        account = str(was.get("account") or "")
+        for key in ("title", "by", "at", "titled", "count", "first", "last", "account"):
+            if key in was:
+                st[key] = was[key]
+        for key in ("rejected", "tried", "failed"):
+            st.pop(key, None)
+        path = transcript_of(account, sid, st)
+        try:
+            size = path.stat().st_size if path else 0
+        except OSError:
+            size = 0
+        st.update(offset=size, size=size)
+        if path:
+            st["transcript"] = str(path)
+        else:
+            st.pop("transcript", None)
+        return True
+    return False
+
+
+def inherit(sid, older_ids) -> bool:
+    sid = clean_sid(sid)
+    if not sid:
+        return False
+    with lock(sid) as held:
+        if not held:
+            return False
+        st = read_state(sid)
+        if not inherit_locked(sid, st, older_ids):
+            return False
+        write_state(sid, st)
+        return True
+
+
+def title_of(sid) -> str:
+    sid = clean_sid(sid)
+    if not sid:
+        return ""
+    st = read_state(sid)
+    return (classify_his if st.get("by") == "him" else classify)(st.get("title"))[0]
+
+
+def transcript_of(account: str, sid: str, st: dict) -> Path | None:
+    now = time.time()
+    known = Path(st["transcript"]) if st.get("transcript") else None
+    known = known if known and known.is_file() else None
+    if 0 <= now - float(st.get("looked") or 0) < (RELOOK if known else RELOOK_NONE):
+        return known
+    found = []
+    for p in ACCTS.glob(f"*/projects/*/{sid}.jsonl"):
+        try:
+            found.append((p.stat().st_mtime, p.parent.parent.parent.name == account, str(p)))
+        except OSError:
+            continue
+    st["looked"] = now
+    return Path(max(found)[2]) if found else None
+
+
+
+def show(sid: str, name: str) -> None:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KONSOLE_DBUS")}
+    try:
+        res = subprocess.run([str(STRIP), "summary", sid, name], env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=STRIP_WAIT)
+        if res.returncode != 0:
+            note(sid, f"the title bar was not written (the strip exited {res.returncode})")
+    except (OSError, subprocess.SubprocessError) as err:
+        note(sid, f"the title bar was not written ({err})")
+
+
+def ask(account: str, sid: str, prompt: str) -> tuple[str, str, str]:
+    name, bucket, said = ask_haiku(account, prompt)
+    if name:
+        return name, "haiku", ""
+    note(sid, f"haiku: rejected ({bucket}): {' '.join(said.split())[:120]}")
+    name, local_bucket, said = ask_local(prompt)
+    if name:
+        return name, "local", ""
+    if local_bucket != "local-off":
+        bucket = local_bucket
+        note(sid, f"local: rejected ({bucket}): {' '.join(said.split())[:120]}")
+    return "", "", bucket
+
+
+def name_it(account: str, sid: str, again: bool) -> tuple[str, str]:
+    sid = clean_sid(sid)
+    if not sid or not account:
+        return "", "no session"
+    with lock(sid) as held:
+        if not held:
+            return "", "its state is locked"
+        st = read_state(sid)
+        before = json.dumps(st, sort_keys=True)
+        path = transcript_of(account, sid, st)
+        if path:
+            scan(st, path)
+            st["account"] = account
+        wanted = bool(st.get("count")) if again else due(st)
+        if not path or not wanted:
+            if json.dumps(st, sort_keys=True) != before:
+                write_state(sid, st)
+            if not path:
+                return "", "no transcript"
+            if st.get("title") and not again:
+                return st["title"], f"kept: {st['title']}"
+            return "", "waiting to ask again" if st.get("count") else "nothing asked yet"
+        had = st.get("title")
+        st["tried"] = time.time()
+        name, by, bucket = ask(account, sid, question({**st, "title": None} if again else st))
+        if not name:
+            st.update(failed=int(st.get("failed") or 0) + 1, rejected=bucket)
+            write_state(sid, st)
+            return "", f"rejected ({bucket})" + (f"; kept: {had}" if had else "")
+        st.update(title=name, by=by, at=time.time(), titled=int(st.get("count") or 0), failed=0)
+        st.pop("rejected", None)
+        write_state(sid, st)
+    if again or name != had:
+        show(sid, name)
+    return name, f"named: {name} ({by})"
+
+
+def set_name(account: str, sid: str, text: str) -> str:
+    sid = clean_sid(sid)
+    if not sid or not account:
+        return ""
+    name, bucket = classify_his(text)
+    if not name:
+        note(sid, f"his name: refused ({bucket}): {' '.join(str(text).split())[:120]!r}")
+        return ""
+    with lock(sid) as held:
+        if not held:
+            note(sid, "his name: its state is locked")
+            return ""
+        st = read_state(sid)
+        st.update(title=name, by="him", at=time.time(), account=account, titled=int(st.get("count") or 0), failed=0)
+        st.pop("rejected", None)
+        write_state(sid, st)
+    show(sid, name)
+    return name
+
+
+def refresh(account: str, sid: str) -> str:
+    return name_it(account, sid, again=False)[1]
+
+
+def rename(account: str, sid: str) -> str:
+    return name_it(account, sid, again=True)[0]
+
+
+_started: list[subprocess.Popen] = []
+
+NEW_WINDOWLESS_HOLD = 30
+
+
+def awaiting_its_record(s: dict, now: float) -> bool:
+    if s.get("kind") != "background" or s.get("windowed") is not False:
+        return False
+    started = s.get("started")
+    if isinstance(started, bool) or not isinstance(started, (int, float)) or started <= 0:
+        return False
+    return 0 <= now - started / 1000.0 < NEW_WINDOWLESS_HOLD
+
+
+def tick(sessions) -> list[str]:
+    _started[:] = [p for p in _started if p.poll() is None]
+    out = []
+    now = time.time()
+    for s in sessions:
+        sid, account = clean_sid(s.get("session_id")), str(s.get("account") or "")
+        if not sid or not account:
+            continue
+        with lock(sid, wait=False) as held:
+            if not held:
+                continue
+            st = read_state(sid)
+            before = json.dumps(st, sort_keys=True)
+            lineage = s.get("lineage")
+            if isinstance(lineage, list) and lineage:
+                inherit_locked(sid, st, lineage)
+            path = transcript_of(account, sid, st)
+            if path:
+                scan(st, path)
+            if json.dumps(st, sort_keys=True) != before:
+                write_state(sid, st)
+            if not path or not due(st) or awaiting_its_record(s, now):
+                continue
+        try:
+            with open(LOG, "ab") as log:
+                _started.append(subprocess.Popen([sys.executable, str(ME), "refresh", account, sid],
+                                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                 stderr=log, start_new_session=True))
+        except OSError as err:
+            note(sid, f"its name could not be started: {err}")
+            continue
+        out.append(sid)
+    return out
+
+
+def cmd_list() -> int:
+    rows = []
+    for p in sorted(CACHE.glob("*.title.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        sid = p.name[: -len(".title.json")]
+        st = read_state(sid)
+        rows.append((sid[:8], str(st.get("account") or ""), title_of(sid) or "(no name)", str(st.get("by") or ""),
+                     f"{int(st.get('count') or 0)} asked",
+                     f"last try: {st['rejected']}" if st.get("rejected") else ""))
+    widths = [max((len(r[i]) for r in rows), default=0) for i in range(6)]
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["refresh"] and len(argv) == 3:
+        print(refresh(argv[1], argv[2]))
+        return 0
+    if argv[:1] == ["rename"] and len(argv) == 3:
+        name = rename(argv[1], argv[2])
+        if name:
+            print(name)
+        return 0 if name else 1
+    if argv[:1] == ["set"] and len(argv) >= 3:
+        name = set_name(argv[1], argv[2], " ".join(argv[3:]))
+        if name:
+            print(name)
+        return 0 if name else 1
+    if argv[:1] == ["get"] and len(argv) == 2:
+        name = title_of(argv[1])
+        if name:
+            print(name)
+        return 0 if name else 1
+    if argv == ["list"]:
+        return cmd_list()
+    print(__doc__.split("\n\n")[0], file=sys.stderr)
+    print("usage: claude-title refresh|rename <account> <session-id> | set <account> <session-id> "
+          "<name> | get <session-id> | list", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

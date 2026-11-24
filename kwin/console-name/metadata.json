@@ -1,0 +1,17 @@
+{
+    "KPlugin": {
+        "Id": "claude-console-name",
+        "Name": "Claude hub name Claude window",
+        "Description": "Meta+Shift+N lets him type the name of the focused Claude window, in its title bar and in the hub",
+        "Authors": [
+            {
+                "Name": "claude-hub-linux"
+            }
+        ],
+        "License": "MIT",
+        "Version": "1"
+    },
+    "KPackageStructure": "KWin/Script",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

@@ -1,0 +1,435 @@
+#!/bin/sh
+':' //; case "$(export -p)" in *"export NODE_"*|*"declare -x NODE_"*|*"export BUN_"*|*"declare -x BUN_"*) exec node "$0" "$@";; esac
+':' //; [ -f /usr/local/bin/bun ] && [ -x /usr/local/bin/bun ] && exec /usr/local/bin/bun --no-env-file --config=/dev/null --no-install "$0" "$@"
+':' //; exec node "$0" "$@"
+':' //; : <<'//END-OF-JS'
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execFileSync, spawn } = require('child_process');
+
+const CACHE = path.join(os.homedir(), '.cache', 'claude-console');
+const SUMMARY_LIMIT = 120;
+
+const DOTS = {
+  running: '\u{1F7E0}',   // 🟠 working, needs nothing
+  asking: '\u{1F535}',    // 🔵 waiting on him
+  done: '\u{1F7E2}',      // 🟢 finished
+  error: '\u{1F534}',     // 🔴 went wrong
+};
+
+const ETA_STALE_MS = 180000;
+
+const SKIP_MS = 60000;
+
+
+function readStdin() {
+  try { return fs.readFileSync(0, 'utf8'); } catch { return ''; }
+}
+
+function parse(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function sessionFile(id, suffix) {
+  return path.join(CACHE, `${id.replace(/[^a-zA-Z0-9-]/g, '')}.${suffix}.json`);
+}
+
+function loadJson(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+}
+
+function saveJson(file, value) {
+  try {
+    fs.mkdirSync(CACHE, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(value));
+  } catch { /* a strip is never worth failing a turn over */ }
+}
+
+const CACHE_KEEP_MS = 14 * 86400000;
+const CACHE_SWEEP_EVERY_MS = 86400000;
+const CACHE_SWEEP_MARK = '.swept';
+const SESSION_FILE = /^[A-Za-z0-9-]+\.[A-Za-z0-9_]+\.json$/;
+
+function pruneCache() {
+  try {
+    const now = nowMs();
+    const mark = path.join(CACHE, CACHE_SWEEP_MARK);
+    let last = 0;
+    try { last = fs.statSync(mark).mtimeMs; } catch { /* never swept */ }
+    if (last && now - last >= 0 && now - last < CACHE_SWEEP_EVERY_MS) return;
+    const names = fs.readdirSync(CACHE);
+    fs.writeFileSync(mark, '');
+    fs.utimesSync(mark, now / 1000, now / 1000);
+    for (const name of names) {
+      if (!SESSION_FILE.test(name)) continue;
+      const file = path.join(CACHE, name);
+      try {
+        const st = fs.lstatSync(file);
+        if (st.isFile() && now - st.mtimeMs >= CACHE_KEEP_MS) fs.unlinkSync(file);
+      } catch { /* gone already, or not ours to remove */ }
+    }
+  } catch { /* a strip is never worth failing a turn over */ }
+}
+
+
+const OPENERS = /^(?:hey|hi|hello|ok|okay|so|well|now|and|also|then|please|thanks|thank you|could you|can you|would you|will you|i want you to|i'd like you to|i would like you to|i need you to|i want|i'd like|let's|lets|let us|go ahead and|try to|help me|can we|we should|you should|make sure to)\b[\s,]*/i;
+const FILLER = /\b(?:um+|uh+|erm|like|you know|i mean|kind of|kinda|sort of|sorta|just|basically|actually|really|literally|maybe|perhaps|pretty much)\b[\s,]*/gi;
+
+function summarize(raw) {
+  if (!raw) return '';
+  let s = String(raw)
+    .replace(/```[\s\S]*?```/g, ' ')          // fenced code is never the summary
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/<[^>]+>/g, ' ')                 // reminders, tags
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const slash = s.match(/^\/([a-z0-9][\w-]*)\s*(.*)$/i);
+  if (slash) {
+    const args = slash[2].replace(/\s+/g, ' ').trim();
+    return cap((slash[1].replace(/-/g, ' ') + (args ? ' ' + args : '')).trim());
+  }
+
+  const firstSentence = s.split(/(?<=[.?!])\s+/)[0];
+  if (firstSentence && firstSentence.length >= 12) s = firstSentence;
+
+  s = s.replace(FILLER, ' ').replace(/\s+/g, ' ').trim();
+  for (let i = 0; i < 6; i++) {
+    const shorter = s.replace(OPENERS, '');
+    if (shorter === s) break;
+    s = shorter;
+  }
+  s = s.replace(/\s*[.,;:!?]+\s*$/, '').replace(/\s+/g, ' ').trim();
+  return cap(s);
+}
+
+function cap(s) {
+  if (!s) return '';
+  return s.length <= SUMMARY_LIMIT ? s : s.slice(0, SUMMARY_LIMIT).trim();
+}
+
+
+function account() {
+  try {
+    return path.basename(process.env.CLAUDE_CONFIG_DIR ||
+      fs.realpathSync(path.join(os.homedir(), '.claude')));
+  } catch { return ''; }
+}
+
+function nowMs() {
+  const t = Number(process.env.CLAUDE_CONSOLE_NOW);
+  return Number.isFinite(t) && t > 0 ? t : Date.now();
+}
+
+function span(minutes) {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+function etaWords(eta, now) {
+  if (!eta || typeof eta !== 'object' || eta.v !== 1 || eta.closed) return '';
+  if (typeof eta.itemDoneMs !== 'number' || typeof eta.seen !== 'number') return '';
+  if (!/^\d{2}:\d{2}$/.test(String(eta.itemDone || ''))) return '';
+  if (now - eta.seen > ETA_STALE_MS) return '';
+  const late = Math.floor((now - eta.itemDoneMs) / 60000);
+  if (late >= 1) return `done ~${eta.itemDone}, ${span(late)} late`;
+  return `done ~${eta.itemDone} (in ${span(Math.max(0, Math.round((eta.itemDoneMs - now) / 60000)))})`;
+}
+
+function compose(state, live, eta = '') {
+  const acct = titleCase(live.account || account());
+  const middle = [];
+  if (live.model) middle.push(live.model);
+  if (live.effort) middle.push(effortLabel(live.effort));
+  if (typeof live.tokens === 'number') middle.push(`${Math.round(live.tokens / 1000)}k tokens`);
+
+  const groups = [];
+  if (state.summary) groups.push(state.exact ? state.summary : sentenceCase(state.summary));
+  if (eta) groups.push(eta);
+  if (middle.length) groups.push(middle.join(' \u00b7 '));
+  if (acct) groups.push(acct);
+
+  const dot = DOTS[state.state] || '';
+  const text = groups.join('  \u2014  ');
+  return dot ? `${dot}  ${text}` : text;
+}
+
+function sentenceCase(s) {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function titleCase(s) {
+  if (!s) return s;
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+const EFFORT_LABELS = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'XHigh', max: 'Max', fast: 'Fast' };
+
+function effortLabel(level) {
+  return EFFORT_LABELS[String(level).toLowerCase()] || sentenceCase(String(level));
+}
+
+const { konsoleTab } = require(path.join(path.dirname(fs.realpathSync(__filename)), 'lib', 'claude-tab.js'));
+
+function konsole(id) {
+  return konsoleTab(id);
+}
+
+function currentTitle(k) {
+  try {
+    return execFileSync('qdbus6', [k.svc, k.ses, 'org.kde.konsole.Session.title', '1'],
+      { encoding: 'utf8', timeout: 3000 }).trim();
+  } catch { return null; }
+}
+
+function setTitle(k, title) {
+  try {
+    execFileSync('qdbus6', [k.svc, k.ses, 'org.kde.konsole.Session.setTitle', '1', title],
+      { stdio: 'ignore', timeout: 3000 });
+    return true;
+  } catch { return false; }
+}
+
+function hideMenuBar(k) {
+  const base = '/konsole/MainWindow_1/actions';
+  try {
+    execFileSync('qdbus6',
+      [k.svc, `${base}/options_show_menubar`, 'org.qtproject.Qt.QAction.setChecked', 'true'],
+      { stdio: 'ignore', timeout: 3000 });
+    execFileSync('qdbus6',
+      [k.svc, '/konsole/MainWindow_1', 'org.kde.KMainWindow.activateAction', 'options_show_menubar'],
+      { stdio: 'ignore', timeout: 3000 });
+    execFileSync('qdbus6',
+      [k.svc, `${base}/hamburger_menu`, 'org.qtproject.Qt.QAction.setVisible', 'false'],
+      { stdio: 'ignore', timeout: 3000 });
+    return true;
+  } catch { return false; }
+}
+
+function ours(title) {
+  return Object.values(DOTS).some((d) => title.includes(d));
+}
+
+function birthName(title) {
+  return /^claude · \d{1,2}:\d{2}$/.test(title) || title === 'Claude account';
+}
+
+const NOT_IN_A_NAME = /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028-\u202f\u2060-\u206f\ufeff\ufff9-\ufffb]/;
+const NAME_LIMIT = 80;        // the longest he may type; a model's is held to 64 where it is written
+
+function writtenName(id) {
+  const name = loadJson(sessionFile(id, 'title')).title;
+  if (typeof name !== 'string') return '';
+  const s = name.trim();
+  if (s.length < 3 || s.length > NAME_LIMIT || NOT_IN_A_NAME.test(s)) return '';
+  return s;
+}
+
+function sameTitle(a, b) {
+  return String(a).replace(/\s+/g, ' ').trim() === String(b).replace(/\s+/g, ' ').trim();
+}
+
+function render(id, tab) {
+  const k = tab || konsole(id);
+  if (!k) return;                                   // not in Konsole: nothing to write to
+
+  const stateFile = sessionFile(id, 'state');
+  const state = loadJson(stateFile);
+  if (state.pinned) {
+    const now = currentTitle(k);
+    if (!now || !birthName(now)) return;
+    delete state.pinned;
+    delete state.written_tab;
+    saveJson(stateFile, state);
+  }
+
+  if (!state.menubar && hideMenuBar(k)) {
+    saveJson(stateFile, { ...state, menubar: 'hidden' });
+    state.menubar = 'hidden';
+  }
+
+  const live = loadJson(sessionFile(id, 'live'));
+  const eta = etaWords(loadJson(sessionFile(id, 'eta')), nowMs());
+  const name = writtenName(id);
+  const title = compose(name ? { ...state, summary: name, exact: true } : state, live, eta);
+  if (!title) return;
+
+  const tabKey = `${k.svc} ${k.ses}`;
+  const age = nowMs() - state.written_at;
+  if (state.written && state.written_tab === tabKey && sameTitle(state.written, title) &&
+      typeof state.written_at === 'number' && age >= 0 && age < SKIP_MS) return true;
+
+  const now = currentTitle(k);
+  if (state.written && now && !ours(now) && !birthName(now) && !sameTitle(now, state.written)) {
+    saveJson(stateFile, { ...state, pinned: true });
+    return;
+  }
+  if (now && sameTitle(now, title)) {
+    saveJson(stateFile, { ...state, written: title, written_tab: tabKey, written_at: nowMs() });
+    return true;
+  }
+
+  if (!setTitle(k, title)) return false;
+  saveJson(stateFile, { ...state, written: title, written_tab: tabKey, written_at: nowMs() });
+  return true;
+}
+
+
+function contextTokens(cw) {
+  if (!cw || typeof cw !== 'object') return undefined;
+  const u = cw.current_usage;
+  if (u && typeof u === 'object') {
+    const n = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens']
+      .reduce((sum, k) => sum + (Number(u[k]) || 0), 0);
+    if (n > 0) return n;
+  }
+  if (typeof cw.used_percentage === 'number' && typeof cw.context_window_size === 'number')
+    return Math.round(cw.used_percentage * cw.context_window_size / 100);
+  return undefined;
+}
+
+function statusline(data) {
+  const id = String(data.session_id || '');
+  if (!id) return;
+
+  const live = {
+    account: account(),
+    model: data.model && data.model.display_name ? String(data.model.display_name) : '',
+    effort: data.fast_mode ? 'fast'
+      : (data.effort && data.effort.level ? String(data.effort.level) : ''),
+    ctx: data.context_window && typeof data.context_window.used_percentage === 'number'
+      ? Math.round(data.context_window.used_percentage) : undefined,
+    tokens: contextTokens(data.context_window),
+  };
+  saveJson(sessionFile(id, 'live'), live);
+
+  if (data.rate_limits && live.account) {
+    const dir = path.join(os.homedir(), '.cache', 'claude-hub-account');
+    const file = path.join(dir, `live-${live.account}.json`);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(`${file}.${process.pid}`, JSON.stringify(data.rate_limits));
+      fs.renameSync(`${file}.${process.pid}`, file);
+    } catch { /* the picker falls back to its own fetch */ }
+  }
+
+  const stateFile = sessionFile(id, 'state');
+  const state = loadJson(stateFile);
+  if (!state.state) saveJson(stateFile, { ...state, state: 'running' });
+
+  render(id);
+}
+
+function lastTurnFailed(transcriptPath) {
+  if (!transcriptPath) return false;
+  let text = '';
+  try {
+    const fd = fs.openSync(transcriptPath, 'r');
+    const { size } = fs.fstatSync(fd);
+    const span = Math.min(size, 200 * 1024);
+    const buf = Buffer.alloc(span);
+    fs.readSync(fd, buf, 0, span, size - span);
+    fs.closeSync(fd);
+    text = buf.toString('utf8');
+  } catch { return false; }
+  const lines = text.split('\n').filter(Boolean);
+  let from = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].includes('"type":"user"')) { from = i; break; }
+  }
+  return lines.slice(from).some((line) => line.includes('"isApiErrorMessage":true'));
+}
+
+const CLEAN_EXITS = new Set(['clear', 'logout', 'prompt_input_exit', 'exit', 'other']);
+
+function state(data, want) {
+  const id = String(data.session_id || '');
+  if (!id) return;
+
+  const file = sessionFile(id, 'state');
+  const current = loadJson(file);
+  const next = { ...current };
+
+  if (want === 'running') {
+    next.state = 'running';
+    if (!current.summary) {
+      const summary = summarize(data.prompt);
+      if (summary) next.summary = summary;
+      betterSummary(id, data.transcript_path);
+    }
+  } else if (want === 'asking') {
+    next.state = 'asking';
+  } else if (want === 'done') {
+    next.state = lastTurnFailed(data.transcript_path) ? 'error' : 'done';
+  } else if (want === 'ended') {
+    const reason = String(data.reason || '');
+    if (current.state === 'running') next.state = 'error';
+    else if (reason && !CLEAN_EXITS.has(reason)) next.state = 'error';
+    else next.state = current.state || 'done';
+  } else {
+    next.state = want;
+  }
+
+  saveJson(file, next);
+  render(id);
+}
+
+function setSummary(id, text) {
+  if (!id) return;
+  const file = sessionFile(id, 'state');
+  const current = loadJson(file);
+  const summary = cap(String(text || '').replace(/\s+/g, ' ').trim());
+  if (!summary) return;
+  saveJson(file, { ...current, summary });
+  render(id);
+}
+
+function retitle(id, svc, ses, text) {
+  const summary = cap(String(text || '').replace(/\s+/g, ' ').trim());
+  if (!id || !svc || !ses || !summary) return false;
+  const file = sessionFile(id, 'state');
+  const next = { ...loadJson(file), summary };
+  delete next.pinned;
+  delete next.written;
+  saveJson(file, next);
+  return render(id, { svc, ses });
+}
+
+function betterSummary(id, transcript) {
+  if (process.env.CLAUDE_CONSOLE_SUMMARY === 'off') return;
+  try {
+    spawn(require('path').join(require('os').homedir(), '.local/bin/claude-console-summarize'),
+      [account(), id, transcript || ''],
+      { detached: true, stdio: 'ignore' }).unref();
+  } catch { /* the derived line stays */ }
+}
+
+function main() {
+  const mode = process.argv[2] || 'statusline';
+  if (mode === 'summary') {
+    setSummary(process.argv[3], process.argv.slice(4).join(' '));
+    process.exit(0);
+  }
+  if (mode === 'retitle') {
+    const [id, svc, ses, ...words] = process.argv.slice(3);
+    process.exit(retitle(id, svc, ses, words.join(' ')) ? 0 : 1);
+  }
+  if (mode === 'render') {
+    const id = String(process.argv[3] || '');
+    if (id) render(id);
+    pruneCache();
+    process.exit(0);
+  }
+  const data = parse(readStdin()) || {};
+  if (mode === 'statusline') statusline(data);
+  else if (mode === 'state') state(data, process.argv[3] || 'running');
+  pruneCache();
+  process.exit(0);
+}
+
+try { main(); } catch (e) { if (process.env.CLAUDE_CONSOLE_DEBUG) console.error(e); process.exit(0); }

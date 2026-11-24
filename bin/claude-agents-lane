@@ -1,0 +1,1239 @@
+#!/usr/bin/env python3
+"""claude-agents-lane: keep agent work in agents.slice, behind your apps.
+
+Agent work is the Claude Code daemons, their sessions and subagents, and everything they start: test runs, headless
+browsers, MCP servers, a memory worker. It used to share app.slice with your own apps at the same CPU weight (100), so
+under load the compositor's D-Bus thread waited behind it. agents.slice (CPUWeight=20, next to this file) ranks agent
+work behind your apps.
+
+A slice only ranks what is inside it, and nothing starts a Claude inside this one: a Claude is born in the cgroup of
+whatever started it, usually a Konsole tab's scope, and everything it spawns later stays there with it. So this tool
+moves what runs outside the lane into it. It is run when a Claude window opens (claude-window asks for a round and does
+not wait for it) and every minute (claude-agents-lane.timer), because a daemon respawned by any other path lands in
+that caller's group.
+
+  adopt [--dry-run] [--json]   move every Claude Code tree that runs outside agents.slice into a scope of its own
+                               inside it; one line per scope, nothing when there is none (--dry-run also says which
+                               trees it would leave where they are)
+  status [--json]              the lane's weight, how many agent processes are in it, how many a round would move,
+                               which trees it leaves, and the lane's share of the CPU over a 2 s sample
+
+What is a root:
+
+  - A Claude: a process of your user manager (user@<uid>.service) whose EXECUTABLE is a file directly in your install
+    folder, ~/.local/share/claude/versions/ (the home from the password database, never $HOME), and that runs under
+    one of Claude's names. The executable says what a process is, the command line only which kind: `claude daemon`,
+    `claude bg-<helper>`, or a session (no subcommand: `claude`, `claude --resume ...`,
+    `claude -p ...`). Never comm, which is the version string for sessions. The bundled `ugrep` is Claude's
+    executable under another name and is no Claude; an executable that cannot be read is nobody's.
+  - A look-alike is no Claude either: a file named claude anywhere else, or in some other claude/versions folder. It
+    is never moved, only counted ("lookalikes" in the JSON): if Claude's installer ever moves, the lane takes nothing,
+    and that count is what shows it.
+  - The claude-mem worker, in the one form that runs here: bun, bun.exe or node whose argv[1] itself is a
+    worker-service.cjs in your home, below a `plugins` folder and then a `claude-mem` one. Anything else is no worker.
+  - Never a client: a Claude with the argument `attach` (it draws a window you type into) or `agents` (the hub's short
+    polls) anywhere before a bare `--`. A client is not a root, and below a root it is not taken along either.
+  - Never any other subcommand (stop, logs, mcp, update, ...), a `claude ... --bg` client, `--version` or `--help`.
+  - Nothing outside your user manager.
+
+What moves, and what stays:
+
+  - A tree is the top-most root and its descendants. Ancestors stay: a session under a shell moves, the shell and its
+    Konsole do not. A window of yours below a root stays as well, with what runs below it.
+  - Only out of scopes. A service is run by its unit: its stop, its restart and its KillMode rules are all about the
+    processes in its cgroup, so a tree in a service is left there and counted.
+  - Only from the units of your windows (your terminal window and a chat app, told by their executable): the unit a
+    window runs in, when that unit is named after it, and the unit it was launched in (run-p<pid>-i<n>.scope, which
+    `systemd-run --scope` makes). A root outside the lane is taken only from such a unit.
+  - Strays, every round: a descendant of a root that already lives in the lane, found outside it in such a unit, goes
+    into a new scope of its own.
+  - Everything else was put where it is on purpose (`systemd-run --scope -p MemoryMax=...`, snapd). It stays and is
+    counted ("placed", and "placed_trees" for whole agent trees: the number to watch), never named.
+  - A scope in the lane is not part of the graphical session, on purpose: a Claude outlives a logout (lingering is on).
+
+How a move is made, by your user manager, over the session bus:
+
+  - A move never names a process by its number. Each process is first HELD (a pidfd) and then looked at again: only
+    one that still has the start time it was scanned with, is not a zombie, and is still what the scan decided by (its
+    cgroup, comm, executable and arguments) is handed over, as that pidfd (StartTransientUnit with PIDFDs). The tree's
+    root is held first and looked at once more, last, after every member of the piece. A root that changed ends its
+    tree for the round. Nothing is ever added to a scope that exists.
+  - The manager itself checks each descriptor and then acts on the number, two system calls apart; that gap is the
+    manager's, and a number comes round again only after pid_max others.
+  - In pieces of 16: one message on the session bus carries 16 file descriptors (dbus-daemon's built-in limit). A
+    bigger tree moves in several scopes in the same round, the root's last.
+  - A process that ends under the call fails the call, which is then made again with the ones still there, a few
+    times. What a round does not get, the next one finds.
+  - A round has a deadline of its own, 25 s from its start: no piece and no retry starts after it, and what is left is
+    the next round's (one line on stderr, the same in "errors", exit 1).
+  - It never stops, restarts or changes a unit. A scope goes when its last process has gone.
+
+The lane pass, in every round of adopt that is not a dry run (harden_lane):
+
+  - Every process the scan found in the lane gets its oom_score_adj raised to 400 when it is a Claude Code process and
+    to 600 when it is anything else, and its soft core-file limit and its soft realtime-priority limit set to 0 (the
+    hard limits stay). KWin sits at 200, so the lane loses before the desktop does. A value is only ever raised, never
+    lowered, and a process that has it all gets no call.
+  - Once per round, in adopt only (never in a dry run, never in status), and it runs before the first move, so a tree is
+    hardened in the round after the one that moves it. Its time is at most 5 s of the round's 25 s.
+  - It prints nothing and has no part in the report or the exit status.
+  - Left alone: a zombie, a process that is not yours, one whose executable or arguments cannot be read, your windows
+    and the clients that draw in them, and what runs below them up to the first agent root on the way up.
+  - prlimit is the one call in this tool that names a process by its number; each process is held by a descriptor on
+    its /proc/<pid> directory and looked at through it before and after the call.
+  - It is inherited: everything an agent starts later gets the same adj and limits wherever it runs. Launchers start
+    their window with `systemd-run --user --scope`, which execs in place, so the window keeps the agent's values. A
+    part of your desktop that an agent restarts has to be restarted with `systemctl --user restart`, so your own
+    manager starts it with its own settings.
+  - No core files from a nested session an agent runs, even with CLAUDE_HUB_NESTED_CORES=1: that switch only skips the
+    script's own `ulimit -c 0`. A core file there needs a run outside the lane with `ulimit -c unlimited`.
+  - Undo: revert the change. A raised oom_score_adj can be written back by the same user (typically to 200).
+
+Never a command line in the output or in a scope's description: kinds, pids, counts and unit names only.
+
+Test switches: CLAUDE_HUB_AGENTS_LANE_PROC (a fake /proc), CLAUDE_HUB_AGENTS_LANE_UID, CLAUDE_HUB_AGENTS_LANE_CGROUP (a
+fake /sys/fs/cgroup, for status), CLAUDE_HUB_AGENTS_LANE_RECORD (a file: every call to the mover is appended to it as
+a JSON line instead of reaching the bus, and the fake /proc's cgroup files are rewritten the way the manager would).
+RECORD also feeds the lane pass's hardener. A fake /proc without a RECORD file never gets a mover or a hardener. The
+hardener refuses the real /proc under any other name and writes a rehearsal folder only when it holds the marker file
+claude-agents-lane-fake-proc, which no procfs can hold.
+
+A round costs one scan of /proc and imports nothing heavy (no argparse, dataclasses, pathlib or D-Bus bindings until
+there is something to move): it runs every minute.
+"""
+from __future__ import annotations
+
+import os
+import pwd
+import resource
+import sys
+import time
+
+SLICE = "agents.slice"
+WANTED_WEIGHT = 20
+SYSTEMD = ("org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager")
+SETTLE_SECONDS = 2.0
+CALL_TIMEOUT_MS = 15000
+MAX_TRIES = 5
+ROUND_SECONDS = 25
+PASS_SECONDS = 5.0
+FDS_PER_CALL = 16
+SAMPLE_SECONDS = 2.0
+NEVER_MOVED = ("konsole",)
+WINDOWS = ("/usr/bin/konsole",)
+CLIENT = "client"
+CLIENT_WORDS = ("attach", "agents")
+CLIENT_FLAGS = ("--bg", "--background")
+NOT_A_SESSION_FLAGS = ("--version", "-v", "-V", "--help", "-h")
+WORKER_RUNTIMES = ("bun", "bun.exe", "node")
+WORKER_SCRIPT, WORKER_FOLDER, WORKER_PLUGINS = "worker-service.cjs", "claude-mem", "plugins"
+
+
+def his_home() -> str:
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return ""
+    return os.path.normpath(home) if os.path.isabs(home) else ""
+
+
+HOME = his_home()
+CLAUDE_VERSIONS = os.path.join(HOME, ".local", "share", "claude", "versions") if HOME else ""
+
+
+
+class Config:
+    def __init__(self, proc: str = "/proc", uid: int = 0, cgroup: str = "/sys/fs/cgroup", record: str = ""):
+        self.proc, self.uid, self.cgroup, self.record = proc, uid, cgroup, record
+        self.user_prefix = f"/user.slice/user-{uid}.slice/user@{uid}.service/"
+        self.lane = self.user_prefix + SLICE
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        env = os.environ
+        return cls(proc=env.get("CLAUDE_HUB_AGENTS_LANE_PROC") or "/proc",
+                   uid=int(env.get("CLAUDE_HUB_AGENTS_LANE_UID") or os.getuid()),
+                   cgroup=env.get("CLAUDE_HUB_AGENTS_LANE_CGROUP") or "/sys/fs/cgroup",
+                   record=env.get("CLAUDE_HUB_AGENTS_LANE_RECORD") or "")
+
+    def in_lane(self, cgroup: str) -> bool:
+        return cgroup == self.lane or cgroup.startswith(self.lane + "/")
+
+    def relative(self, cgroup: str) -> str:
+        return cgroup[len(self.user_prefix):] if cgroup.startswith(self.user_prefix) else cgroup
+
+    def cgroup_dir(self, *parts: str) -> str:
+        return os.path.join(self.cgroup, "user.slice", f"user-{self.uid}.slice",
+                            f"user@{self.uid}.service", *parts)
+
+    def path(self, pid: int, name: str) -> str:
+        return os.path.join(self.proc, str(pid), name)
+
+
+class Proc:
+    __slots__ = ("pid", "ppid", "comm", "state", "cgroup", "argv", "exe", "start")
+
+    def __init__(self, pid: int, ppid: int, comm: str, state: str, cgroup: str, argv: list[str],
+                 exe: str = "", start: int = 0):
+        self.pid, self.ppid, self.comm, self.state, self.cgroup, self.argv = pid, ppid, comm, state, cgroup, argv
+        self.exe = exe
+        self.start = start
+
+
+def read_text(path: str) -> str:
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+def read_cgroup(path: str) -> str | None:
+    try:
+        text = read_text(path)
+    except OSError:
+        return None
+    for line in text.split("\n"):
+        if line.startswith("0::"):
+            cgroup = line[3:]
+            return cgroup[:-len(" (deleted)")] if cgroup.endswith(" (deleted)") else cgroup
+    return None
+
+
+def parse_stat(text: str) -> tuple[str, str, int, int]:
+    close = text.rfind(")")
+    fields = text[close + 2:].split()
+    return text[text.find("(") + 1:close], fields[0], int(fields[1]), int(fields[19])
+
+
+def read_exe(path: str) -> str:
+    try:
+        exe = os.readlink(path)
+    except OSError:
+        return ""
+    return exe[:-len(" (deleted)")] if exe.endswith(" (deleted)") else exe
+
+
+def read_argv(path: str) -> list[str]:
+    with open(path, "rb") as f:
+        raw = f.read()
+    argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0")]
+    if argv and argv[-1] == "":
+        argv.pop()
+    return argv
+
+
+def scan(cfg: Config) -> dict[int, Proc]:
+    procs: dict[int, Proc] = {}
+    try:
+        names = os.listdir(cfg.proc)
+    except OSError:
+        return procs
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        cgroup = read_cgroup(cfg.path(pid, "cgroup"))
+        if cgroup is None or not cgroup.startswith(cfg.user_prefix):
+            continue
+        try:
+            comm, state, ppid, start = parse_stat(read_text(cfg.path(pid, "stat")))
+            argv = read_argv(cfg.path(pid, "cmdline"))
+        except (OSError, ValueError, IndexError):
+            continue
+        procs[pid] = Proc(pid, ppid, comm, state, cgroup, argv, read_exe(cfg.path(pid, "exe")), start)
+    return procs
+
+
+def owned(cfg: Config, pid: int) -> bool:
+    try:
+        for line in read_text(cfg.path(pid, "status")).split("\n"):
+            if line.startswith("Uid:"):
+                return int(line.split()[1]) == cfg.uid
+    except (OSError, ValueError, IndexError):
+        return os.path.isdir(os.path.join(cfg.proc, str(pid)))
+    return True
+
+
+def same_process(cfg: Config, pid: int, start: int) -> bool:
+    try:
+        _, state, _, now = parse_stat(read_text(cfg.path(pid, "stat")))
+    except (OSError, ValueError, IndexError):
+        return False
+    return now == start and state not in ("Z", "X")
+
+
+def now_in(cfg: Config, proc: Proc) -> str | None:
+    cgroup = read_cgroup(cfg.path(proc.pid, "cgroup"))
+    if cgroup is None:
+        return None
+    try:
+        if read_argv(cfg.path(proc.pid, "cmdline")) != proc.argv or read_exe(cfg.path(proc.pid, "exe")) != proc.exe:
+            return None
+        comm, state, _, start = parse_stat(read_text(cfg.path(proc.pid, "stat")))
+    except (OSError, ValueError, IndexError):
+        return None
+    return cgroup if start == proc.start and state not in ("Z", "X") and comm == proc.comm else None
+
+
+def as_scanned(cfg: Config, proc: Proc) -> bool:
+    return now_in(cfg, proc) == proc.cgroup
+
+
+
+def looks_like_subcommand(word: str) -> bool:
+    return word[:1].islower() and word.isascii() and all(c.islower() or c.isdigit() or c == "-" for c in word)
+
+
+def runs_as_claude(exe: str, argv: list[str]) -> bool:
+    if not argv:
+        return False
+    name = os.path.basename(argv[0].split(" ")[0])
+    return name == "claude" or (name != "" and name == os.path.basename(exe))
+
+
+def is_claude(exe: str, argv: list[str]) -> bool:
+    return (bool(exe) and bool(CLAUDE_VERSIONS) and os.path.dirname(exe) == CLAUDE_VERSIONS
+            and os.path.basename(exe) != "" and runs_as_claude(exe, argv))
+
+
+def looks_like_claude(exe: str, argv: list[str]) -> bool:
+    if not exe or not runs_as_claude(exe, argv) or is_claude(exe, argv):
+        return False
+    folder = os.path.dirname(exe)
+    return (os.path.basename(exe) == "claude"
+            or (os.path.basename(folder) == "versions" and os.path.basename(os.path.dirname(folder)) == "claude"))
+
+
+def is_worker(exe: str, argv: list[str]) -> bool:
+    if os.path.basename(exe) not in WORKER_RUNTIMES or len(argv) < 2 or not HOME:
+        return False
+    script, home = argv[1], HOME if HOME.endswith("/") else HOME + "/"
+    if os.path.basename(script) != WORKER_SCRIPT or os.path.normpath(script) != script or not script.startswith(home):
+        return False
+    folders = script[len(home):].split("/")[:-1]
+    return WORKER_PLUGINS in folders and WORKER_FOLDER in folders[folders.index(WORKER_PLUGINS) + 1:]
+
+
+def classify(exe: str, argv: list[str]) -> str | None:
+    if is_worker(exe, argv):
+        return "claude-mem worker"
+    if not is_claude(exe, argv):
+        return None
+    head = argv[0].split(" ")
+    rest = head[1:] + argv[1:]
+    for word in rest:
+        if word == "--":
+            break
+        if word in CLIENT_WORDS:
+            return CLIENT
+    if not rest:
+        return "claude session"
+    first = rest[0]
+    if first == "daemon":
+        following = rest[1] if len(rest) > 1 else ""
+        return "claude daemon" if following in ("", "run") or following.startswith("-") else None
+    helper = first.lstrip("-")
+    if helper.startswith("bg-") and helper[3:].replace("-", "").isalpha():
+        return "claude " + helper
+    if looks_like_subcommand(first):
+        return None
+    if any(a in CLIENT_FLAGS or a in NOT_A_SESSION_FLAGS for a in rest):
+        return None
+    return "claude session"
+
+
+
+class Tree:
+    def __init__(self, root: Proc, kind: str, members: list[Proc], origin: str, stray: bool = False, part: int = 0):
+        self.root, self.kind = root.pid, kind
+        self.root_scanned = root
+        self.members = members
+        self.origin = origin
+        self.stray = stray
+        self.part = part
+
+    @property
+    def pids(self) -> list[int]:
+        return [member.pid for member in self.members]
+
+
+def children_of(procs: dict[int, Proc]) -> dict[int, list[int]]:
+    kids: dict[int, list[int]] = {}
+    for pid in sorted(procs):
+        kids.setdefault(procs[pid].ppid, []).append(pid)
+    return kids
+
+
+def kinds_of(procs: dict[int, Proc]) -> dict[int, str]:
+    kinds = {}
+    for pid, proc in procs.items():
+        kind = classify(proc.exe, proc.argv)
+        if kind:
+            kinds[pid] = kind
+    return kinds
+
+
+def staying(procs: dict[int, Proc], kinds: dict[int, str]) -> set[int]:
+    return {pid for pid, proc in procs.items()
+            if proc.comm in NEVER_MOVED or proc.exe in WINDOWS or kinds.get(pid) == CLIENT}
+
+
+def subtree(root: int, procs: dict[int, Proc], kids: dict[int, list[int]], stays: set[int]) -> list[int]:
+    out, seen = [root], {root}
+    i = 0
+    while i < len(out):
+        for child in kids.get(out[i], ()):
+            if child not in seen and child not in stays:
+                seen.add(child)
+                out.append(child)
+        i += 1
+    return out
+
+
+def owning_unit(cfg: Config, cgroup: str) -> str:
+    if not cgroup.startswith(cfg.user_prefix):
+        return ""
+    for part in cgroup[len(cfg.user_prefix):].split("/"):
+        if part.endswith((".scope", ".service")):
+            return part
+    return ""
+
+
+def movable(cfg: Config, proc: Proc) -> bool:
+    return (proc.state not in ("Z", "X") and not cfg.in_lane(proc.cgroup)
+            and owning_unit(cfg, proc.cgroup).endswith(".scope") and owned(cfg, proc.pid))
+
+
+def launched_pid(unit: str) -> int:
+    if not (unit.startswith("run-p") and unit.endswith(".scope")):
+        return 0
+    pid, _, rest = unit[len("run-p"):-len(".scope")].partition("-i")
+    return int(pid) if pid.isascii() and pid.isdigit() and rest.isascii() and rest.isdigit() else 0
+
+
+def window_units(cfg: Config, procs: dict[int, Proc]) -> set[str]:
+    windows = {pid: proc for pid, proc in procs.items() if proc.exe in WINDOWS and proc.state not in ("Z", "X")}
+    units = set()
+    for pid, proc in windows.items():
+        unit = owning_unit(cfg, proc.cgroup)
+        if unit.endswith(f"-{pid}.scope"):
+            units.add(unit)
+    oldest: dict[str, int] = {}
+    for proc in procs.values():
+        unit = owning_unit(cfg, proc.cgroup)
+        if launched_pid(unit) in windows:
+            oldest[unit] = min(oldest.get(unit, proc.start), proc.start)
+    for unit, start in oldest.items():
+        if start >= windows[launched_pid(unit)].start:
+            units.add(unit)
+    return units
+
+
+def placed(cfg: Config, proc: Proc, units: set[str]) -> bool:
+    return owning_unit(cfg, proc.cgroup) not in units
+
+
+def has_ancestor_in(pid: int, procs: dict[int, Proc], among, stays: set[int]) -> bool:
+    seen = {pid}
+    parent = procs[pid].ppid
+    while parent in procs and parent not in seen:
+        if parent in stays:
+            return False
+        if parent in among:
+            return True
+        seen.add(parent)
+        parent = procs[parent].ppid
+    return False
+
+
+class Plan:
+
+    def __init__(self):
+        self.trees: list[Tree] = []
+        self.left: list[tuple[int, str, str]] = []
+        self.placed: list[tuple[int, str]] = []
+        self.placed_trees = 0
+        self.lookalikes = 0
+
+    def left_units(self) -> list[str]:
+        return sorted({unit for _, _, unit in self.left})
+
+    def placed_units(self) -> list[str]:
+        return sorted({unit for _, unit in self.placed})
+
+
+def plan(cfg: Config, procs: dict[int, Proc]) -> Plan:
+    kids = children_of(procs)
+    kinds = kinds_of(procs)
+    stays = staying(procs, kinds)
+    units = window_units(cfg, procs)
+    roots = {pid: kind for pid, kind in kinds.items() if kind != CLIENT and pid not in stays}
+    ours = {pid for pid in roots if cfg.in_lane(procs[pid].cgroup)
+            or (movable(cfg, procs[pid]) and owning_unit(cfg, procs[pid].cgroup) in units)}
+    result = Plan()
+    result.lookalikes = sum(1 for proc in procs.values() if looks_like_claude(proc.exe, proc.argv))
+    placed_at: dict[int, str] = {}
+
+    def count(m: int) -> None:
+        placed_at[m] = owning_unit(cfg, procs[m].cgroup) or cfg.relative(procs[m].cgroup)
+
+    for pid in sorted(roots):
+        proc = procs[pid]
+        if pid in ours:
+            if has_ancestor_in(pid, procs, ours, stays):
+                continue
+            below = []
+            for m in subtree(pid, procs, kids, stays)[1:]:
+                member = procs[m]
+                if member.state in ("Z", "X") or cfg.in_lane(member.cgroup):
+                    continue
+                if placed(cfg, member, units):
+                    if owned(cfg, m):
+                        count(m)
+                elif movable(cfg, member):
+                    below.append(m)
+            if not cfg.in_lane(proc.cgroup):
+                members, origin, stray = [pid] + below, proc.cgroup, False
+            elif below:
+                members, origin, stray = below, procs[below[0]].cgroup, True
+            else:
+                continue
+            result.trees.append(Tree(proc, roots[pid], [procs[m] for m in members], cfg.relative(origin), stray))
+        elif proc.state in ("Z", "X") or not owned(cfg, pid):
+            continue
+        elif movable(cfg, proc):
+            if has_ancestor_in(pid, procs, ours, stays):
+                continue
+            for m in subtree(pid, procs, kids, stays | ours):
+                member = procs[m]
+                if member.state not in ("Z", "X") and not cfg.in_lane(member.cgroup) and owned(cfg, m):
+                    count(m)
+        elif not has_ancestor_in(pid, procs, roots, stays):
+            result.left.append((pid, roots[pid], owning_unit(cfg, proc.cgroup) or cfg.relative(proc.cgroup)))
+    result.placed = sorted(placed_at.items())
+    tops = {pid for pid in placed_at if pid in roots}
+    result.placed_trees = sum(1 for pid in tops if not has_ancestor_in(pid, procs, tops, stays))
+    return result
+
+
+
+class MoveError(Exception):
+    pass
+
+
+class PidGone(MoveError):
+    ...
+
+
+class NoBus(Exception):
+    pass
+
+
+def gone_in(message: str) -> bool:
+    return "UnixProcessIdUnknown" in message or "No such process" in message or "ESRCH" in message
+
+
+def fits(pins: list) -> None:
+    if len(pins) > FDS_PER_CALL:
+        raise MoveError(f"{len(pins)} processes in one call: a message on his session bus carries {FDS_PER_CALL}")
+
+
+class BusMover:
+
+    def __init__(self, cfg: Config, address: str):
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+        self.cfg, self.Gio, self.GLib = cfg, Gio, GLib
+        flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+        self.bus = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+        self.bus.set_exit_on_close(False)
+        if not self.bus.get_capabilities() & Gio.DBusCapabilityFlags.UNIX_FD_PASSING:
+            raise RuntimeError("this bus connection cannot pass file descriptors")
+
+    def pin(self, pid: int) -> int:
+        return os.pidfd_open(pid)
+
+    def unpin(self, fd: int) -> None:
+        os.close(fd)
+
+    def start_scope(self, unit: str, pins: list[tuple[int, int, int]], description: str) -> list[int]:
+        fits(pins)
+        V = self.GLib.Variant
+        name, path, interface = SYSTEMD
+        try:
+            fds = self.Gio.UnixFDList.new()
+            places = [fds.append(fd) for _, _, fd in pins]
+            props = [("Description", V("s", description)), ("Slice", V("s", SLICE)),
+                     ("CollectMode", V("s", "inactive-or-failed")),
+                     ("OOMPolicy", V("s", "continue")),
+                     ("PIDFDs", V("ah", places))]
+            self.bus.call_with_unix_fd_list_sync(
+                name, path, interface, "StartTransientUnit", V("(ssa(sv)a(sa(sv)))", (unit, "fail", props, [])),
+                self.GLib.VariantType("(o)"), self.Gio.DBusCallFlags.NONE, CALL_TIMEOUT_MS, fds, None)
+        except self.GLib.Error as err:
+            text = str(err.message)
+            raise (PidGone if gone_in(text) else MoveError)((text.splitlines() or ["StartTransientUnit"])[0])
+        return self.settle(unit, pins)
+
+    def settle(self, unit: str, pins: list[tuple[int, int, int]]) -> list[int]:
+        asked = f"{self.cfg.lane}/{unit}"
+        end = time.monotonic() + SETTLE_SECONDS
+        while True:
+            landed, waiting = [], []
+            for pid, start, _ in pins:
+                cgroup = read_cgroup(self.cfg.path(pid, "cgroup"))
+                if cgroup is None or not same_process(self.cfg, pid, start):
+                    continue
+                if cgroup == asked:
+                    landed.append(pid)
+                elif not self.cfg.in_lane(cgroup):
+                    waiting.append((pid, cgroup))
+            if not waiting:
+                return landed
+            if time.monotonic() >= end:
+                if landed:
+                    return landed
+                pid, cgroup = waiting[0]
+                raise MoveError(f"{unit} was queued but process {pid} is still in {self.cfg.relative(cgroup)}")
+            time.sleep(0.02)
+
+
+class RecordingMover:
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def there(self, pid: int) -> bool:
+        return os.path.isdir(os.path.join(self.cfg.proc, str(pid)))
+
+    def pin(self, pid: int) -> int:
+        if not self.there(pid):
+            raise ProcessLookupError(f"no process {pid} in the fake /proc")
+        return -1
+
+    def unpin(self, fd: int) -> None:
+        pass
+
+    def start_scope(self, unit: str, pins: list[tuple[int, int, int]], description: str) -> list[int]:
+        import json
+        fits(pins)
+        pids = [pid for pid, _, _ in pins]
+        gone = [pid for pid in pids if not self.there(pid)]
+        with open(self.cfg.record, "a") as f:
+            f.write(json.dumps({"call": "StartTransientUnit", "unit": unit, "slice": SLICE, "pids": pids,
+                                "starts": [start for _, start, _ in pins], "description": description,
+                                "gone": gone}) + "\n")
+        if gone:
+            raise PidGone("Failed to set unit properties: No such process")
+        for pid in pids:
+            try:
+                with open(self.cfg.path(pid, "cgroup"), "w") as f:
+                    f.write(f"0::{self.cfg.lane}/{unit}\n")
+            except OSError:
+                pass
+        return pids
+
+
+def bus_address(cfg: Config) -> str:
+    address = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if address:
+        return address
+    socket_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{cfg.uid}", "bus")
+    return f"unix:path={socket_path}" if os.path.exists(socket_path) else ""
+
+
+def make_mover(cfg: Config):
+    if cfg.record:
+        return RecordingMover(cfg)
+    if cfg.proc != "/proc":
+        raise NoBus("a fake /proc (CLAUDE_HUB_AGENTS_LANE_PROC) is only for the recording mover")
+    address = bus_address(cfg)
+    if not address:
+        raise NoBus("no user bus socket")
+    try:
+        return BusMover(cfg, address)
+    except Exception as err:
+        raise NoBus((str(err).splitlines() or [type(err).__name__])[0])
+
+
+
+class Outcome:
+    def __init__(self, tree: Tree, unit: str):
+        self.tree, self.unit = tree, unit
+        self.moved: list[int] = []
+        self.error = ""
+
+
+class OutOfTime(Exception):
+    ...
+
+
+class Deadline:
+
+    def __init__(self, clock, seconds: float = ROUND_SECONDS):
+        self.clock = clock
+        self.ends = clock() + seconds
+        self.left = 0
+
+    def check(self) -> None:
+        if self.clock() >= self.ends:
+            raise OutOfTime()
+
+
+def pieces(tree: Tree) -> list[Tree]:
+    members = tree.members
+    cut = [Tree(tree.root_scanned, tree.kind, members[i:i + FDS_PER_CALL], tree.origin, tree.stray, i // FDS_PER_CALL)
+           for i in range(0, len(members), FDS_PER_CALL)] or [tree]
+    return cut if tree.stray else cut[1:] + cut[:1]
+
+
+def release(mover, pins: list[tuple[int, int, int]]) -> None:
+    for _, _, fd in pins:
+        try:
+            mover.unpin(fd)
+        except OSError:
+            pass
+
+
+def hold(cfg: Config, mover, members: list[Proc], root: Proc) -> list[tuple[int, int, int]] | None:
+    try:
+        root_hold = mover.pin(root.pid)
+    except ProcessLookupError:
+        return None
+    except OSError as err:
+        raise MoveError(f"could not take a hold on process {root.pid}: {err.strerror or err}")
+    root_pin = (root.pid, root.start, root_hold)
+    pins: list[tuple[int, int, int]] = []
+    for member in members:
+        if member.pid == root.pid:
+            continue
+        try:
+            fd = mover.pin(member.pid)
+        except ProcessLookupError:
+            continue
+        except OSError as err:
+            release(mover, pins + [root_pin])
+            raise MoveError(f"could not take a hold on process {member.pid}: {err.strerror or err}")
+        if as_scanned(cfg, member):
+            pins.append((member.pid, member.start, fd))
+        else:
+            release(mover, [(member.pid, member.start, fd)])
+    where = now_in(cfg, root)
+    if where is None or not (where == root.cgroup or cfg.in_lane(where)):
+        release(mover, pins + [root_pin])
+        return None
+    if where == root.cgroup and any(member.pid == root.pid for member in members):
+        pins.insert(0, root_pin)
+    else:
+        release(mover, [root_pin])
+    return pins
+
+
+def start_tree(cfg: Config, mover, unit: str, tree: Tree, deadline: Deadline | None = None) -> list[int] | None:
+    about = "more of " if tree.part else "strays of " if tree.stray else ""
+    description = f"Agent work: {about}{tree.kind} {tree.root} (claude-agents-lane)"
+    members = list(tree.members)
+    for _ in range(MAX_TRIES):
+        if deadline is not None:
+            deadline.check()
+        pins = hold(cfg, mover, members, tree.root_scanned)
+        if pins is None:
+            return None
+        if not pins:
+            return []
+        try:
+            if deadline is not None:
+                deadline.check()
+            return mover.start_scope(unit, pins, description)
+        except PidGone as err:
+            lost = str(err)
+        finally:
+            release(mover, pins)
+        held = {pid for pid, _, _ in pins}
+        asked = [member for member in members if member.pid in held]
+        members = [member for member in asked if same_process(cfg, member.pid, member.start)]
+        if members == asked:
+            raise MoveError(f"the manager lost a process ({lost}) while all {len(asked)} it was asked for are still here")
+    return None
+
+
+def adopt_trees(cfg: Config, trees: list[Tree], mover, deadline: Deadline | None = None) -> list[Outcome]:
+    outcomes = []
+    for n, tree in enumerate(trees):
+        for piece in pieces(tree):
+            outcome = Outcome(piece, f"agent-{piece.root}-{os.urandom(4).hex()}.scope")
+            moved: list[int] | None = []
+            try:
+                moved = start_tree(cfg, mover, outcome.unit, piece, deadline)
+            except OutOfTime:
+                deadline.left = len(trees) - n
+                return outcomes
+            except MoveError as err:
+                outcome.error = str(err)
+            outcome.moved = moved or []
+            outcomes.append(outcome)
+            if outcome.error or moved is None:
+                break
+    return outcomes
+
+
+
+OOM_CLAUDE = 400
+OOM_OTHER = 600
+RLIMITS = {"core": ("Max core file size", "RLIMIT_CORE"), "rtprio": ("Max realtime priority", "RLIMIT_RTPRIO")}
+
+
+class NoHardener(Exception):
+    pass
+
+
+def limit_word(word: str) -> int:
+    return resource.RLIM_INFINITY if word == "unlimited" else int(word)
+
+
+def parse_limits(text: str) -> dict[str, tuple[int, int]]:
+    got: dict[str, tuple[int, int]] = {}
+    for line in text.split("\n"):
+        for key, (label, _) in RLIMITS.items():
+            if line.startswith(label + " "):
+                words = line[len(label):].split()
+                if len(words) < 2:
+                    raise ValueError(f"the {label} line has no soft and hard limit")
+                got[key] = (limit_word(words[0]), limit_word(words[1]))
+    missing = [label for key, (label, _) in RLIMITS.items() if key not in got]
+    if missing:
+        raise ValueError(f"no {', '.join(missing)} line in the limits file")
+    return got
+
+
+def wanted(tier: int, adj: int, limits: dict[str, tuple[int, int]]) -> dict:
+    todo: dict = {}
+    if adj < tier:
+        todo["oom_score_adj"] = tier
+    for key in RLIMITS:
+        soft, hard = limits[key]
+        if soft != 0:
+            todo[key] = (0, hard)
+    return todo
+
+
+def tier_of(proc: Proc) -> int | None:
+    if not proc.exe or not proc.argv:
+        return None
+    return OOM_CLAUDE if is_claude(proc.exe, proc.argv) else OOM_OTHER
+
+
+class ProcHardener:
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def bind(self, pid: int) -> int:
+        return os.open(os.path.join(self.cfg.proc, str(pid)), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    def unbind(self, fd: int) -> None:
+        os.close(fd)
+
+    def read(self, fd: int, name: str) -> str:
+        f = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=fd)
+        try:
+            raw = b""
+            while chunk := os.read(f, 65536):
+                raw += chunk
+        finally:
+            os.close(f)
+        return raw.decode("utf-8", "replace")
+
+    def write_adj(self, fd: int, value: int) -> None:
+        f = os.open("oom_score_adj", os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC, dir_fd=fd)
+        try:
+            os.write(f, f"{value}\n".encode())
+        finally:
+            os.close(f)
+
+    def set_limit(self, pid: int, which: str, limit: tuple[int, int]) -> None:
+        resource.prlimit(pid, getattr(resource, RLIMITS[which][1]), limit)
+
+
+def on_the_real_proc(path: str) -> bool:
+    try:
+        return os.stat(path).st_dev == os.stat("/proc").st_dev
+    except OSError:
+        return True
+
+
+FAKE_PROC_MARK = "claude-agents-lane-fake-proc"
+
+
+class RecordingHardener(ProcHardener):
+
+    def __init__(self, cfg: Config):
+        super().__init__(cfg)
+        self.bound: dict[int, int] = {}
+        self.fake_dev = None
+        if not on_the_real_proc(cfg.proc):
+            import stat
+            try:
+                marker = os.stat(os.path.join(cfg.proc, FAKE_PROC_MARK), follow_symlinks=False)
+                if stat.S_ISREG(marker.st_mode):
+                    self.fake_dev = marker.st_dev
+            except OSError:
+                pass
+        self.fake = self.fake_dev is not None
+
+    def bind(self, pid: int) -> int:
+        fd = super().bind(pid)
+        self.bound[fd] = pid
+        return fd
+
+    def unbind(self, fd: int) -> None:
+        self.bound.pop(fd, None)
+        super().unbind(fd)
+
+    def note(self, line: dict) -> None:
+        import json
+        with open(self.cfg.record, "a") as f:
+            f.write(json.dumps(line) + "\n")
+
+    def overwrite(self, name: str, text: str, dir_fd: int | None = None) -> None:
+        import stat
+        if self.fake_dev is None:
+            return
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or info.st_dev != self.fake_dev:
+            return
+        fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        with os.fdopen(fd, "w") as f:
+            held = os.fstat(f.fileno())
+            if not stat.S_ISREG(held.st_mode) or held.st_dev != self.fake_dev:
+                return
+            os.ftruncate(f.fileno(), 0)
+            f.write(text)
+
+    def write_adj(self, fd: int, value: int) -> None:
+        self.overwrite("oom_score_adj", f"{value}\n", fd)
+        self.note({"call": "oom_score_adj", "pid": self.bound[fd], "value": value})
+
+    def set_limit(self, pid: int, which: str, limit: tuple[int, int]) -> None:
+        if self.fake:
+            self.rewrite_limit(pid, which, limit)
+        self.note({"call": "set_limit", "pid": pid, "limit": which, "to": list(limit)})
+
+    def rewrite_limit(self, pid: int, which: str, limit: tuple[int, int]) -> None:
+        path = self.cfg.path(pid, "limits")
+        label = RLIMITS[which][0]
+        lines = read_text(path).split("\n")
+        for n, line in enumerate(lines):
+            if line.startswith(label + " "):
+                units = " ".join(line[len(label):].split()[2:])
+                soft, hard = ("unlimited" if number == resource.RLIM_INFINITY else str(number) for number in limit)
+                lines[n] = f"{label:<25} {soft:<20} {hard:<20} {units:<10}"
+        self.overwrite(path, "\n".join(lines))
+
+
+def make_hardener(cfg: Config):
+    if cfg.proc != "/proc" and on_the_real_proc(cfg.proc):
+        raise NoHardener("the real /proc under another name (CLAUDE_HUB_AGENTS_LANE_PROC): only /proc itself is hardened")
+    if cfg.record:
+        return RecordingHardener(cfg)
+    if cfg.proc != "/proc":
+        raise NoHardener("a fake /proc (CLAUDE_HUB_AGENTS_LANE_PROC) is only for the recording hardener")
+    if os.geteuid() != cfg.uid or os.geteuid() == 0:
+        raise NoHardener("only his own user may harden his processes")
+    return ProcHardener(cfg)
+
+
+def under_hold(hardener, fd: int) -> tuple[str, int]:
+    _, state, _, start = parse_stat(hardener.read(fd, "stat"))
+    return state, start
+
+
+def still_scanned(cfg: Config, hardener, fd: int, proc: Proc) -> bool:
+    state, start = under_hold(hardener, fd)
+    if start != proc.start or state in ("Z", "X"):
+        return False
+    cgroup = now_in(cfg, proc)
+    return cgroup is not None and cfg.in_lane(cgroup)
+
+
+def harden_pid(cfg: Config, proc: Proc, tier: int, hardener, result: dict) -> None:
+    try:
+        fd = hardener.bind(proc.pid)
+    except (OSError, ValueError):
+        result["failed"] += 1
+        return
+    done = 0
+    try:
+        try:
+            adj = int(hardener.read(fd, "oom_score_adj"))
+            todo = wanted(tier, adj, parse_limits(hardener.read(fd, "limits")))
+        except (OSError, ValueError):
+            result["failed"] += 1
+            return
+        for what, value in todo.items():
+            try:
+                if not still_scanned(cfg, hardener, fd, proc):
+                    break
+                if what == "oom_score_adj":
+                    hardener.write_adj(fd, value)
+                else:
+                    hardener.set_limit(proc.pid, what, value)
+            except Exception:
+                result["failed"] += 1
+                continue
+            if what != "oom_score_adj":
+                try:
+                    hit = under_hold(hardener, fd)[1] == proc.start
+                except (OSError, ValueError, IndexError):
+                    hit = False
+                if not hit:
+                    result["failed"] += 1
+                    break
+            done += 1
+    finally:
+        try:
+            hardener.unbind(fd)
+        except OSError:
+            pass
+        if done:
+            result["hardened"] += 1
+
+
+def below_a_window(pid: int, procs: dict[int, Proc], kinds: dict[int, str], stays: set[int]) -> bool:
+    seen: set[int] = set()
+    while pid in procs:
+        if pid in seen:
+            return True
+        seen.add(pid)
+        if pid in stays:
+            return True
+        if pid in kinds:
+            return False
+        pid = procs[pid].ppid
+    return False
+
+
+def harden_lane(cfg: Config, procs: dict[int, Proc], hardener, budget) -> dict:
+    result = {"hardened": 0, "failed": 0, "out_of_time": False}
+    kinds = kinds_of(procs)
+    stays = staying(procs, kinds)
+    for pid in sorted(procs):
+        proc = procs[pid]
+        if not cfg.in_lane(proc.cgroup) or proc.state in ("Z", "X") or below_a_window(pid, procs, kinds, stays):
+            continue
+        tier = tier_of(proc)
+        if tier is None or not owned(cfg, pid):
+            continue
+        try:
+            budget.check()
+        except OutOfTime:
+            result["out_of_time"] = True
+            break
+        harden_pid(cfg, proc, tier, hardener, result)
+    return result
+
+
+
+def describe(verb: str, tree: Tree, size: int, destination: str) -> str:
+    if tree.part:
+        what = f"{size} more process(es) of {tree.kind} {tree.root}"
+    elif tree.stray:
+        what = f"{size} stray process(es) of {tree.kind} {tree.root}"
+    else:
+        what = f"{tree.kind} {tree.root} (+{max(size - 1, 0)})"
+    return f"{verb} {what} from {tree.origin} -> {destination}"
+
+
+def cmd_adopt(cfg: Config, flags: set[str], mover=None, clock=None) -> int:
+    deadline = Deadline(clock or time.monotonic)
+    dry_run, as_json = "--dry-run" in flags, "--json" in flags
+    procs = scan(cfg)
+    planned = plan(cfg, procs)
+    trees, left = planned.trees, planned.left_units()
+    report: dict = {"dry_run": dry_run, "adopted": [], "errors": [],
+                    "left": {"trees": len(planned.left), "units": left}, "lookalikes": planned.lookalikes,
+                    "placed": len(planned.placed), "placed_trees": planned.placed_trees}
+
+    def finish(code: int) -> int:
+        if as_json:
+            import json
+            print(json.dumps(report))
+        return code
+
+    if dry_run:
+        for tree in (piece for whole in trees for piece in pieces(whole)):
+            to = f"{SLICE}/agent-{tree.root}-*.scope"
+            report["adopted"].append({"kind": tree.kind, "pid": tree.root, "processes": len(tree.members),
+                                      "stray": tree.stray, "part": tree.part, "from": tree.origin, "to": to})
+            if not as_json:
+                print(describe("would adopt", tree, len(tree.members), to), flush=True)
+        if planned.left and not as_json:
+            print(f"would leave {len(planned.left)} tree(s) where they are, in units that are not scopes: "
+                  f"{', '.join(left)}", flush=True)
+        if planned.placed and not as_json:
+            among = f", {planned.placed_trees} whole agent tree(s) among them" if planned.placed_trees else ""
+            print(f"would leave {len(planned.placed)} process(es) in {len(planned.placed_units())} unit(s) where "
+                  f"somebody put them{among}", flush=True)
+        return finish(0)
+    seconds = min(PASS_SECONDS, deadline.ends - deadline.clock())
+    if seconds > 0:
+        try:
+            harden_lane(cfg, procs, make_hardener(cfg), Deadline(deadline.clock, seconds))
+        except Exception:
+            pass
+    if not trees:
+        return finish(0)
+    if mover is None:
+        try:
+            mover = make_mover(cfg)
+        except NoBus as err:
+            note = f"claude-agents-lane: no session bus ({err}); {len(trees)} tree(s) not moved"
+            report["errors"].append(note)
+            print(note, file=sys.stderr, flush=True)
+            return finish(0)
+    failed = False
+    for outcome in adopt_trees(cfg, trees, mover, deadline):
+        tree = outcome.tree
+        if outcome.error:
+            failed = True
+            note = f"claude-agents-lane: could not adopt {tree.kind} {tree.root}: {outcome.error}"
+            report["errors"].append(note)
+            print(note, file=sys.stderr, flush=True)
+        if not outcome.moved:
+            continue
+        to = f"{SLICE}/{outcome.unit}"
+        report["adopted"].append({"kind": tree.kind, "pid": tree.root, "processes": len(outcome.moved),
+                                  "stray": tree.stray, "part": tree.part, "from": tree.origin, "to": to,
+                                  "unit": outcome.unit})
+        if not as_json:
+            print(describe("adopted", tree, len(outcome.moved), to), flush=True)
+    if deadline.left:
+        failed = True
+        note = (f"claude-agents-lane: the round's {ROUND_SECONDS} s ran out; {deadline.left} tree(s) not reached "
+                "or not finished, left for the next round")
+        report["errors"].append(note)
+        print(note, file=sys.stderr, flush=True)
+    return finish(1 if failed else 0)
+
+
+def read_number(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def usage_usec(directory: str) -> int | None:
+    try:
+        with open(os.path.join(directory, "cpu.stat")) as f:
+            for line in f.read().splitlines():
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def agents_inside(cfg: Config, procs: dict[int, Proc]) -> int:
+    kids = children_of(procs)
+    kinds = kinds_of(procs)
+    stays = staying(procs, kinds)
+    members: set[int] = set()
+    for pid, kind in kinds.items():
+        if kind != CLIENT and pid not in stays:
+            members.update(subtree(pid, procs, kids, stays))
+    return sum(1 for m in members if procs[m].state not in ("Z", "X") and cfg.in_lane(procs[m].cgroup))
+
+
+def lane_status(cfg: Config, sleep=time.sleep) -> dict:
+    procs = scan(cfg)
+    planned = plan(cfg, procs)
+    lane_dir = cfg.cgroup_dir(SLICE)
+    status: dict = {"lane": SLICE, "exists": os.path.isdir(lane_dir),
+                    "weight": read_number(os.path.join(lane_dir, "cpu.weight")),
+                    "inside": agents_inside(cfg, procs), "outside": sum(len(tree.members) for tree in planned.trees),
+                    "outside_trees": len(planned.trees),
+                    "left_trees": len(planned.left), "left_units": planned.left_units(),
+                    "placed": len(planned.placed), "placed_units": len(planned.placed_units()),
+                    "placed_trees": planned.placed_trees, "lookalikes": planned.lookalikes,
+                    "siblings": {}, "cpu_share": None, "lane_cores": None, "user_cores": None,
+                    "sample_seconds": SAMPLE_SECONDS}
+    for name in ("app.slice", "session.slice", "background.slice"):
+        weight = read_number(cfg.cgroup_dir(name, "cpu.weight"))
+        if weight is not None:
+            status["siblings"][name] = weight
+    if not status["exists"]:
+        return status
+    user_dir = cfg.cgroup_dir()
+    before = (usage_usec(lane_dir), usage_usec(user_dir))
+    started = time.monotonic()
+    sleep(SAMPLE_SECONDS)
+    elapsed = max(time.monotonic() - started, 1e-6)
+    after = (usage_usec(lane_dir), usage_usec(user_dir))
+    if None not in before + after:
+        lane_used, user_used = after[0] - before[0], after[1] - before[1]
+        status["lane_cores"] = round(lane_used / 1e6 / elapsed, 2)
+        status["user_cores"] = round(user_used / 1e6 / elapsed, 2)
+        status["cpu_share"] = round(lane_used / user_used, 4) if user_used > 0 else 0.0
+    return status
+
+
+def cmd_status(cfg: Config, flags: set[str], sleep=time.sleep) -> int:
+    s = lane_status(cfg, sleep)
+    if "--json" in flags:
+        import json
+        print(json.dumps(s))
+        return 0
+    siblings = ", ".join(f"{name} {weight}" for name, weight in s["siblings"].items())
+    if not s["exists"]:
+        weight = f"not created yet (nothing has been moved into {SLICE})"
+    elif s["weight"] == WANTED_WEIGHT:
+        weight = f"{s['weight']}" + (f"  (beside {siblings})" if siblings else "")
+    else:
+        weight = (f"{s['weight']}, not the {WANTED_WEIGHT} it should be: link agents.slice into "
+                  f"~/.config/systemd/user and run systemctl --user daemon-reload")
+    print(f"{SLICE} cpu.weight   {weight}")
+    outside = f"{s['outside']} outside it"
+    if s["outside"]:
+        outside += f" in {s['outside_trees']} tree(s); claude-agents-lane adopt moves them"
+    print(f"agent processes      {s['inside']} inside the lane, {outside}")
+    if s["left_trees"]:
+        print(f"left where they are  {s['left_trees']} tree(s) in units that are not scopes: "
+              f"{', '.join(s['left_units'])}")
+    if s["placed"]:
+        among = f", {s['placed_trees']} whole agent tree(s) among them" if s["placed_trees"] else ""
+        print(f"placed elsewhere     {s['placed']} process(es) in {s['placed_units']} unit(s), left where somebody "
+              f"put them{among}")
+    if s["lookalikes"]:
+        print(f"look-alikes          {s['lookalikes']} process(es) that look like Claude but are not in his install "
+              "folder: never moved")
+    if s["cpu_share"] is None:
+        print("lane share of CPU    n/a (no lane to sample)")
+    else:
+        print(f"lane share of CPU    {s['cpu_share'] * 100:.1f}% of his user CPU over {s['sample_seconds']:.0f} s "
+              f"({s['lane_cores']} of {s['user_cores']} cores busy)")
+    return 0
+
+
+COMMANDS = {"adopt": {"--dry-run", "--json"}, "status": {"--json"}}
+
+
+def main(argv: list[str] | None = None, *, mover=None, sleep=time.sleep, clock=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__.strip())
+        return 0
+    if not argv or argv[0] not in COMMANDS or not set(argv[1:]) <= COMMANDS[argv[0]]:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    cfg, flags = Config.from_env(), set(argv[1:])
+    if argv[0] == "adopt":
+        return cmd_adopt(cfg, flags, mover, clock)
+    return cmd_status(cfg, flags, sleep)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

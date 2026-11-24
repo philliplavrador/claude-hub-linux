@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "claude-hub-linux"
+            }
+        ],
+        "Category": "Focus",
+        "Description": "as requested: no program takes him to another desktop by focusing its window there. With kwinrc ActivationDesktopPolicy=DoNothing KWin stays put; this gives his keyboard back to the window he was in",
+        "EnabledByDefault": false,
+        "Id": "claude-desks-hold",
+        "License": "MIT",
+        "Name": "Claude hub desktop hold",
+        "Version": "1"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

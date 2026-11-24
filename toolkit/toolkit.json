@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "projectsRoot": "~",
+  "projects": {},
+  "defaults": {
+    "skills": ["find-skills", "stop-slop", "ui-craft", "task-observer"],
+    "rules": [],
+    "agents": [],
+    "outputStyle": null,
+    "hooks": ["trail", "precompact-snapshot", "resume-guard", "screenshot-guard", "desktop-switch-guard", "window-guard", "bg"],
+    "mcp": [],
+    "plugins": [],
+    "mods": []
+  },
+  "externalHooks": {},
+  "pluginHints": {}
+}

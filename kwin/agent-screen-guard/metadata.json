@@ -1,0 +1,13 @@
+{
+    "KPlugin": {
+        "Id": "claude-agent-screen-guard",
+        "Name": "Claude hub agent screen guard",
+        "Description": "Minimizes any window an AI agent opens on the user's screen",
+        "Authors": [{ "Name": "claude-hub-linux" }],
+        "License": "MIT",
+        "Version": "1"
+    },
+    "KPackageStructure": "KWin/Script",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}

@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""claude-hub: the Claude hub popup.
+
+Meta+Return pops the hub up as a Konsole with its title bar, centred on the screen
+you are looking at, above every other window, never tiled, not in the taskbar, Alt+Tab or the pager. It is one Konsole
+running `claude-hub run`, kept running and hidden between uses so it appears at once, and started hidden at login.
+Every Claude lives on a KDE desktop of its own (claude-desks); desktop 1 is yours.
+
+  claude-hub show     Meta+Return (claude-window.sh): hidden → shown, shown → hidden (a
+                               signal to the popup); opens the popup when it is not running
+  claude-hub start    at login (claude-hub.service): open it hidden, unless it runs
+  claude-hub hide     hide it (Meta+Q on the popup, claude-close)
+  claude-hub run      the popup's own process: what runs inside its Konsole
+  claude-hub list     the rows the popup shows (--json for the data: the rows)
+
+The list: Tools, your desktop 1, every Claude desktop in desktop order (number, name, account, model, effort, the
+tokens in its context in thousands, state: working, waiting on a task, waiting for you, idle, NEEDS YOU, stopped,
+no window, starting), then the Claudes that have no desktop. The rows are numbered from Tools: Tools 1, your desktop 2,
+an optional extra desktop 3 when it exists, then the first Claude's desktop. A row's number is always one more than
+KDE's own desktop number, which claude-desks and every other file still say. `here` marks the desktop you are on, and
+the selection starts there.
+
+Tools is the first row, so Home, Enter, Enter starts a Claude. Enter or → shows Tools in place of the list: New Claude
+Code, New Desktop, Usages and Skills (a row appears only when its helper is installed). Esc
+comes back to the list. New Claude Code asks the model, then the effort, before it makes anything. Skills are reusable
+prompts, one file each in a hub-skills/ folder beside bin/ (name:, model:, effort:, summary: lines, then --- and the prompt); Enter starts one on a
+desktop of its own, → shows a short summary of what it will do.
+
+Keys: a number typed, then Enter, does the row numbered so, on every screen of the hub (1 Enter opens Tools, 1 2 Enter
+is desktop 12). Typing a letter filters (a case-insensitive subsequence of number, account, name and state);
+Backspace edits it; ↑↓ Home End PgUp PgDn move. Enter goes: the popup hides and KDE shows that desktop with its Claude
+focused; a stopped Claude, or one whose window is gone, comes back first (claude-desks resume). R on a Claude's desktop
+asks for a name; Del on one asks, then ends it. Esc drops a typed number, else clears the filter, else hides. The popup
+also hides when it loses the focus, on Meta+Return and on Meta+Q.
+
+Rows come from the desktop service (claude-desks watch, which writes hub.json every second); when that file is more
+than 5 s old the popup looks for itself, so a stopped service makes it slower, never empty. While hidden it draws
+nothing and looks at nothing.
+
+Test switches: those of claude-desks (CLAUDE_HUB_HUB_ROWS among them), plus CLAUDE_HUB_REFRESH and CLAUDE_HUB_SWEEP
+(seconds).
+"""
+from __future__ import annotations
+
+import collections
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import pty
+import re
+import secrets
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import termios
+import textwrap
+import threading
+import time
+import tty
+import typing
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+PARTS = (
+    "01_desktop_popup_state.py",
+    "02_autoswap_rows.py",
+    "03_menus.py",
+    "03b_list_numbers.py",
+    "05_list_and_pty.py",
+    "08_popup_rows.py",
+    "09_popup_shown.py",
+    "10_popup_session.py",
+    "12_popup_screens.py",
+    "14b_popup_pick.py",
+    "15_popup.py",
+)
+__parts_dir__ = Path(__file__).resolve().parent.parent / "lib" / "claude-hub"
+__codes__ = []
+for __part__ in PARTS:
+    __part_name__ = "claude_hub_" + __part__[:-3]
+    __codes__.append(importlib.machinery.SourceFileLoader(__part_name__, str(__parts_dir__ / __part__)).get_code(__part_name__))
+for __code__ in __codes__:
+    exec(__code__, globals())
+del __parts_dir__, __part__, __part_name__, __codes__, __code__
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,10 @@
+{
+  "description": "Before Claude Code compacts, save what the summary loses (agent briefs, the messages a person typed, git status, background jobs) to $CLAUDE_CONFIG_DIR/compactions/<session>.md; after it, append the summary it wrote",
+  "event": [
+    "PreCompact",
+    "PostCompact"
+  ],
+  "matcher": null,
+  "timeout": 20,
+  "codex": false
+}

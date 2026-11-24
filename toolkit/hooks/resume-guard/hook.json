@@ -1,0 +1,8 @@
+{
+  "description": "Denies a Bash command that resumes a conversation (claude --resume / -r <id>) while a Claude with that session id still runs on any account, which would make a second live copy of one Claude; --fork-session is allowed (resume-guard.js)",
+  "event": "PreToolUse",
+  "matcher": "Bash",
+  "timeout": 5,
+  "runtime": "bun",
+  "codex": { "matcher": "Bash" }
+}

@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""claude-timeout: end a Claude Code child at a timeout without cutting off a token refresh in flight.
+
+Why: Claude Code refreshes its OAuth token under a lock DIRECTORY, <storage>/.oauth_refresh.lock, held from before the
+token POST until after the save. The server rotates the refresh token on the POST; a child killed before the save
+loses the new one and the account is signed out. A plain SIGKILL at a timeout can land inside that window.
+
+Two modes (Python 3 stdlib only, imports nothing of this repo's):
+
+  claude-timeout [--storage DIR] SECONDS -- CMD [ARGS...]
+      Runs CMD as a child (stdin, stdout, stderr, any other descriptor the wrapper inherited, environment and
+      process group are the wrapper's own). At SECONDS, or when the wrapper itself gets SIGTERM, SIGINT or SIGHUP,
+      it runs the SAFE STOP: wait while a refresh of THIS child's tree is in flight (poll 250 ms, at most 45 s), then
+      SIGKILL the child, everything it started, and reap the child. If the child exits by itself first, the wrapper
+      still stops whatever it left running (the same wait, freeze and kill) and then exits with the child's own
+      status; a child that ends by itself with no stop requested is plain pass-through and its leftovers are not
+      touched. Otherwise it exits 124 (timeout) or 128+n (signal n sent to the wrapper;
+      it does not re-raise the signal). With no stop it exits with the child's status (128+n for a signalled child;
+      126 / 127 when CMD cannot be run, as coreutils timeout does). No SIGTERM step: Claude's own SIGTERM shutdown
+      waits only 2-4 s for a refresh and then exits, so it adds no safety once the lock is clear.
+
+  claude-timeout [--storage DIR] --wait-refresh PID [--limit SECONDS]
+      For callers that do their own kill. Exits 0 once PID, and everything PID started, no longer holds the refresh
+      lock, or 1 at the limit (default 45 s).
+
+The tree: the child and its descendants, read from /proc/<pid>/task/*/children recursively (a scan of the parent
+pids in /proc/*/stat where the kernel has no such file). Each member is kept as (pid, start time), so a pid that was
+reused is never taken for a member and never signalled. The stop freezes the tree (SIGSTOP, re-walked until nothing
+new appears), looks once more, and only then kills; a member that took the lock in the last instant is let go again
+(SIGCONT) and waited for. So `sh -c 'claude; :'`, `timeout`, `flock` in front of claude, and claude's own helpers
+(MCP servers, hooks, Bash-tool commands, even those in a session of their own) are all covered. Not supported: a pty
+relay in front of claude (`sudo`, `su --pty`, `script`); it answers the freeze by stopping itself or its process
+group, and no caller does that. Two kinds of process are not part of the tree: one that was already orphaned before
+the stop began, and a Claude daemon with its whole subtree (a descendant that leads its own session, sid == pid, and
+whose argv[0] is named claude and argv[1] is "daemon"; only those two words are read). The daemon outlives its client
+by design; it is never frozen, killed or counted as the holder of the lock.
+
+A caller that SIGKILLs this wrapper leaves claude (and the tree) running with no deadline: SIGKILL cannot be
+caught. A caller's backstop must therefore be a kill of the whole process group, after --wait-refresh if it can.
+
+Storage folder: --storage, else CLAUDE_SECURESTORAGE_CONFIG_DIR when set (set but empty means ~/.claude, as Claude
+Code's own lookup does), else a non-empty CLAUDE_CONFIG_DIR, else ~/.claude; resolved. In the first mode the
+environment read is the child's, which is the wrapper's own.
+
+In flight means one tree's own refresh: <storage>/.oauth_refresh.lock is a directory AND either
+<storage>/.oauth_refresh.lock.owner (JSON, an int "pid", no secret) names a live member of the tree, or there is no
+owner record and the directory was touched under 2 s ago (the owner is written just after the lock is taken).
+Another process's lock (the daemon's) never delays a stop. Any read error counts as not in flight. The credentials
+file is never opened here, and the owner record is never followed through a link.
+
+Stderr: one notice line, only when it really waited, written after the kill:
+  claude-timeout: waited N s for a sign-in refresh before stopping claude
+Usage errors exit 125. Test knobs, read only when set, and only to LOWER the default: CLAUDE_HUB_TIMEOUT_LOCK_WAIT
+(45), CLAUDE_HUB_TIMEOUT_POLL (0.25), CLAUDE_HUB_TIMEOUT_FRESH (2).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+PROG = "claude-timeout"
+LOCK_NAME = ".oauth_refresh.lock"
+OWNER_NAME = ".oauth_refresh.lock.owner"
+DEFAULT_LOCK_WAIT = 45.0
+DEFAULT_POLL = 0.25
+DEFAULT_FRESH = 2.0
+DEFAULT_LIMIT = 45.0
+OWNER_MAX_BYTES = 65536
+REAP_WAIT = 5.0
+FREEZE_ROUNDS = 5
+KILL_ROUNDS = 4
+
+USAGE = (
+    f"usage: {PROG} [--storage DIR] SECONDS -- CMD [ARGS...]\n"
+    f"       {PROG} [--storage DIR] --wait-refresh PID [--limit SECONDS]"
+)
+HELP_NOTE = (
+    "A caller that SIGKILLs this wrapper leaves claude running with no deadline: a backstop must kill the whole\n"
+    "process group (after --wait-refresh if it can)."
+)
+
+_NUMBER = re.compile(r"^(\d+\.?\d*|\.\d+)$")
+_DIGITS = re.compile(r"^\d+$")
+
+
+class Usage(Exception):
+    pass
+
+
+class Help(Exception):
+    pass
+
+
+
+def knob(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value < minimum or value > default:
+        return default
+    return value
+
+
+def storage_dir(explicit: str | None = None, environ=None) -> str:
+    env = os.environ if environ is None else environ
+    raw = explicit
+    if not raw:
+        secure = env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        raw = secure if secure is not None else env.get("CLAUDE_CONFIG_DIR")
+        if not raw:
+            home = env.get("HOME") or os.path.expanduser("~")
+            raw = os.path.join(home, ".claude")
+    return os.path.realpath(os.path.expanduser(raw))
+
+
+
+def read_stat(pid: int):
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+        fields = data[data.rindex(b")") + 2:].split()
+        return fields[0].decode("ascii"), int(fields[1]), int(fields[19]), int(fields[3])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass
+    except (ProcessLookupError, OverflowError, OSError):
+        return False
+    st = read_stat(pid)
+    if st is not None and st[0] in ("Z", "X"):
+        return False
+    return True
+
+
+def _children_from_proc(pid: int):
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return []
+    found: list[int] = []
+    for tid in tids:
+        path = f"/proc/{pid}/task/{tid}/children"
+        try:
+            with open(path, "rb") as handle:
+                found.extend(int(x) for x in handle.read().split())
+        except FileNotFoundError:
+            if os.path.exists(f"/proc/{pid}/task/{tid}"):
+                return None
+        except (OSError, ValueError):
+            pass
+    return found
+
+
+def _children_by_scan() -> dict[int, list[int]]:
+    out: dict[int, list[int]] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if name.isdigit():
+            st = read_stat(int(name))
+            if st is not None:
+                out.setdefault(st[1], []).append(int(name))
+    return out
+
+
+def is_claude_daemon(pid: int, st) -> bool:
+    if st is None or st[3] != pid:
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            parts = handle.read(4096).split(b"\0", 2)
+    except OSError:
+        return False
+    return len(parts) > 1 and parts[1] == b"daemon" and os.path.basename(parts[0]) == b"claude"
+
+
+def signal_member(pid: int, start: int, sig: int) -> bool:
+    fd = None
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return False
+    except (AttributeError, OSError):
+        fd = None
+    try:
+        st = read_stat(pid)
+        if st is None or st[2] != start:
+            return False
+        try:
+            if fd is not None:
+                try:
+                    signal.pidfd_send_signal(fd, sig)
+                    return True
+                except (ProcessLookupError, PermissionError):
+                    raise
+                except (AttributeError, OSError):
+                    pass
+            os.kill(pid, sig)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+class Tree:
+
+    def __init__(self, pid: int) -> None:
+        self.root = pid
+        st = read_stat(pid)
+        self.members: dict[int, int] = {pid: st[2]} if st is not None else {}
+        self.handled: dict[int, int] = {}
+        self.ours: dict[int, int] = {}
+        self.excluded: set[tuple[int, int]] = set()
+
+    @staticmethod
+    def _there(pid: int, start: int) -> bool:
+        st = read_stat(pid)
+        return st is not None and st[2] == start
+
+    def exists(self, pid: int) -> bool:
+        start = self.members.get(pid)
+        return start is not None and self._there(pid, start)
+
+    def live(self, pid: int) -> bool:
+        start = self.members.get(pid)
+        if start is None:
+            return False
+        st = read_stat(pid)
+        return st is not None and st[2] == start and st[0] not in ("Z", "X")
+
+    def running(self) -> bool:
+        return any(self.live(pid) for pid in list(self.members))
+
+    def refresh(self) -> bool:
+        for pid, start in list(self.members.items()):
+            st = read_stat(pid)
+            gone = st is None or st[2] != start
+            if not gone and pid != self.root and is_claude_daemon(pid, st):
+                self.excluded.add((pid, start))
+                gone = True
+                if self.ours.get(pid) == start:
+                    signal_member(pid, start, signal.SIGCONT)
+            if gone:
+                del self.members[pid]
+                self.handled.pop(pid, None)
+                self.ours.pop(pid, None)
+        for entry in [e for e in self.excluded if not self._there(*e)]:
+            self.excluded.discard(entry)
+        found = False
+        scan = None
+        queue = list(self.members)
+        while queue:
+            pid = queue.pop()
+            kids = _children_from_proc(pid)
+            if kids is None:
+                if scan is None:
+                    scan = _children_by_scan()
+                kids = scan.get(pid, [])
+            for kid in kids:
+                st = read_stat(kid)
+                if st is None or self.members.get(kid) == st[2] or (kid, st[2]) in self.excluded:
+                    continue
+                if is_claude_daemon(kid, st):
+                    self.excluded.add((kid, st[2]))
+                    continue
+                self.members[kid] = st[2]
+                self.handled.pop(kid, None)
+                self.ours.pop(kid, None)
+                queue.append(kid)
+                found = True
+        return found
+
+    def holds(self, pid: int) -> bool:
+        if self.live(pid):
+            return True
+        self.refresh()
+        return self.live(pid)
+
+    def freeze(self) -> bool:
+        for _ in range(FREEZE_ROUNDS):
+            self.refresh()
+            todo = [(p, s) for p, s in self.members.items() if self.handled.get(p) != s]
+            if not todo:
+                return True
+            for pid, start in todo:
+                st = read_stat(pid)
+                self.handled[pid] = start
+                if st is None or st[2] != start or st[0] in ("Z", "X", "T", "t"):
+                    continue
+                if signal_member(pid, start, signal.SIGSTOP):
+                    self.ours[pid] = start
+        self.refresh()
+        return not [1 for p, s in self.members.items() if self.handled.get(p) != s]
+
+    def thaw(self) -> None:
+        for pid, start in list(self.ours.items()):
+            signal_member(pid, start, signal.SIGCONT)
+        self.ours.clear()
+        self.handled.clear()
+
+    def kill(self) -> None:
+        for _ in range(KILL_ROUNDS):
+            found = self.refresh()
+            for pid, start in list(self.members.items()):
+                signal_member(pid, start, signal.SIGKILL)
+            if not found:
+                break
+
+
+
+def in_flight(sd: str, pid: int, fresh: float = DEFAULT_FRESH, tree: Tree | None = None) -> bool:
+    lock = os.path.join(sd, LOCK_NAME)
+    try:
+        st = os.lstat(lock)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    try:
+        fd = os.open(os.path.join(sd, OWNER_NAME), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        try:
+            st = os.lstat(lock)
+        except OSError:
+            return False
+        return abs(time.time() - st.st_mtime) < fresh
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        raw = os.read(fd, OWNER_MAX_BYTES + 1)
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    if len(raw) > OWNER_MAX_BYTES:
+        return False
+    try:
+        record = json.loads(raw)
+    except (ValueError, RecursionError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    owner = record.get("pid")
+    if type(owner) is not int or owner <= 0:
+        return False
+    if tree is not None:
+        return tree.holds(owner)
+    return owner == pid and pid_alive(pid)
+
+
+
+class Args:
+    storage: str | None = None
+    seconds: float | None = None
+    cmd: list[str] | None = None
+    wait_pid: int | None = None
+    limit: float = DEFAULT_LIMIT
+
+
+def _number(text: str, what: str, positive: bool) -> float:
+    if not _NUMBER.match(text):
+        raise Usage(f"{what} must be a number of seconds, got {text!r}")
+    value = float(text)
+    if not math.isfinite(value) or (positive and value <= 0):
+        raise Usage(f"{what} must be {'greater than 0' if positive else 'a number'}, got {text!r}")
+    return value
+
+
+def parse_args(argv: list[str]) -> Args:
+    args = Args()
+    limit_given = False
+    positional: list[str] = []
+    i, n = 0, len(argv)
+
+    def value_of(option: str) -> str:
+        nonlocal i
+        a = argv[i]
+        if a.startswith(option + "="):
+            return a[len(option) + 1:]
+        i += 1
+        if i >= n:
+            raise Usage(f"{option} needs a value")
+        return argv[i]
+
+    while i < n:
+        a = argv[i]
+        if a == "--":
+            break
+        if a in ("-h", "--help"):
+            raise Help()
+        if a == "--storage" or a.startswith("--storage="):
+            args.storage = value_of("--storage")
+        elif a == "--wait-refresh" or a.startswith("--wait-refresh="):
+            text = value_of("--wait-refresh")
+            if not _DIGITS.match(text) or int(text) <= 0:
+                raise Usage(f"--wait-refresh needs a process id, got {text!r}")
+            args.wait_pid = int(text)
+        elif a == "--limit" or a.startswith("--limit="):
+            args.limit = _number(value_of("--limit"), "--limit", positive=False)
+            limit_given = True
+        elif a.startswith("-") and a != "-":
+            raise Usage(f"unknown option {a!r}")
+        else:
+            positional.append(a)
+        i += 1
+
+    if args.wait_pid is not None:
+        if positional or i < n:
+            raise Usage("--wait-refresh takes no SECONDS and no command")
+        return args
+    if limit_given:
+        raise Usage("--limit belongs to --wait-refresh")
+    if not positional:
+        raise Usage("missing SECONDS")
+    if len(positional) > 1:
+        raise Usage(f"unexpected argument {positional[1]!r} before --")
+    if i >= n or argv[i] != "--":
+        raise Usage("missing -- before the command")
+    args.cmd = argv[i + 1:]
+    if not args.cmd:
+        raise Usage("missing command after --")
+    args.seconds = _number(positional[0], "SECONDS", positive=True)
+    return args
+
+
+
+class Waker:
+
+    def __init__(self) -> None:
+        self.r, self.w = os.pipe()
+        os.set_blocking(self.r, False)
+        os.set_blocking(self.w, False)
+        signal.set_wakeup_fd(self.w, warn_on_full_buffer=False)
+
+    def sleep(self, timeout: float) -> None:
+        if timeout <= 0:
+            return
+        select.select([self.r], [], [], timeout)
+        try:
+            while os.read(self.r, 512):
+                pass
+        except BlockingIOError:
+            pass
+
+    def close(self) -> None:
+        signal.set_wakeup_fd(-1)
+        os.close(self.r)
+        os.close(self.w)
+
+
+def status_of(returncode: int) -> int:
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def notice(text: str) -> None:
+    try:
+        sys.stderr.write(f"{PROG}: {text}\n")
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def safe_stop(proc: subprocess.Popen, sd: str, waker: Waker) -> int | None:
+    lock_wait = knob("CLAUDE_HUB_TIMEOUT_LOCK_WAIT", DEFAULT_LOCK_WAIT)
+    poll = knob("CLAUDE_HUB_TIMEOUT_POLL", DEFAULT_POLL, minimum=0.005)
+    fresh = knob("CLAUDE_HUB_TIMEOUT_FRESH", DEFAULT_FRESH)
+    tree = Tree(proc.pid)
+    start = time.monotonic()
+    waited = False
+    result = None
+
+    def exited() -> bool:
+        nonlocal result
+        if result is None:
+            rc = proc.poll()
+            if rc is not None:
+                result = status_of(rc)
+        return result is not None
+
+    def nothing_left() -> bool:
+        return exited() and not tree.running()
+
+    try:
+        while True:
+            while True:
+                tree.refresh()
+                if nothing_left() or not in_flight(sd, proc.pid, fresh, tree):
+                    break
+                elapsed = time.monotonic() - start
+                if elapsed >= lock_wait:
+                    break
+                waited = True
+                waker.sleep(min(poll, lock_wait - elapsed))
+            if nothing_left():
+                break
+            if not tree.freeze():
+                tree.refresh()
+            if nothing_left():
+                break
+            elapsed = time.monotonic() - start
+            if elapsed < lock_wait and in_flight(sd, proc.pid, fresh, tree):
+                waited = True
+                tree.thaw()
+                waker.sleep(min(poll, lock_wait - elapsed))
+                continue
+            break
+    except BaseException:
+        tree.thaw()
+        raise
+    seconds = max(1, round(time.monotonic() - start))
+    if result is None:
+        tree.kill()
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=REAP_WAIT)
+        except subprocess.TimeoutExpired:
+            pass
+    elif tree.running():
+        tree.kill()
+    else:
+        tree.thaw()
+    if waited:
+        notice(f"waited {seconds} s for a sign-in refresh before stopping claude")
+    return result
+
+
+def run(args: Args) -> int:
+    sd = storage_dir(args.storage)
+    state = {"signal": 0}
+
+    def on_signal(signum, _frame):
+        if not state["signal"]:
+            state["signal"] = signum
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        if signal.getsignal(signum) != signal.SIG_IGN:
+            signal.signal(signum, on_signal)
+    signal.signal(signal.SIGCHLD, lambda _s, _f: None)
+    waker = Waker()
+
+    try:
+        proc = subprocess.Popen(args.cmd, close_fds=False)
+    except FileNotFoundError as exc:
+        notice(f"cannot run {args.cmd[0]!r}: {exc.strerror or exc}")
+        return 127
+    except OSError as exc:
+        notice(f"cannot run {args.cmd[0]!r}: {exc.strerror or exc}")
+        return 126
+
+    deadline = time.monotonic() + args.seconds
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            return status_of(rc)
+        if state["signal"]:
+            stopped_with = 128 + state["signal"]
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            stopped_with = 124
+            break
+        waker.sleep(remaining)
+
+    status = safe_stop(proc, sd, waker)
+    return stopped_with if status is None else status
+
+
+
+def wait_refresh(sd: str, pid: int, limit: float) -> int:
+    poll = knob("CLAUDE_HUB_TIMEOUT_POLL", DEFAULT_POLL, minimum=0.005)
+    fresh = knob("CLAUDE_HUB_TIMEOUT_FRESH", DEFAULT_FRESH)
+    deadline = time.monotonic() + limit
+    tree = Tree(pid)
+    while True:
+        if not in_flight(sd, pid, fresh, tree):
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 1
+        time.sleep(min(poll, remaining))
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        args = parse_args(argv)
+    except Help:
+        print(f"{USAGE}\n{HELP_NOTE}")
+        return 0
+    except Usage as exc:
+        sys.stderr.write(f"{PROG}: {exc}\n{USAGE}\n")
+        return 125
+    if args.wait_pid is not None:
+        return wait_refresh(storage_dir(args.storage), args.wait_pid, args.limit)
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

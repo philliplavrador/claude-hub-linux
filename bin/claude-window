@@ -1,0 +1,1586 @@
+#!/usr/bin/env bash
+# claude-window: the process that lives in a Claude tab.
+#
+# The Claude itself runs in the background under Claude Code's own daemon; this tab only shows it (`claude attach`).
+# So a logout, which takes the window away, does not take the Claude with it, and the window can be brought back at
+# the next login. Closing the window yourself still stops that Claude.
+#
+#   claude-window new    <account> [--first-message-file F] [claude flags...]
+#   claude-window attach <account> <id>              reopen a running one
+#   claude-window resume <account> <session id>      reopen one a restart stopped
+#   claude-window tab-session <tab pid>              "<session pid> <cwd>"
+#   claude-window bg-start <account|auto> --cwd D --model M --effort E --first-message-file F [--plugin-dir P]...
+#                                                    a background Claude, no window: one JSON line
+#   claude-window bg-resume <account> <session id> [--model M] [--effort E] [--exact]
+#                                                    wake a chat's ended Claude with its memory
+#                                                    (`claude --bg --resume`), no window, no record: one JSON line
+#
+# Each session has a record, ~/.local/state/claude-hub/claude-windows/<session id>.json, naming the terminal tab
+# that shows it now.
+set -uo pipefail
+
+ACCTS=${CLAUDE_HUB_ACCOUNTS:-$HOME/.claude-accounts}
+RECORDS=${CLAUDE_HUB_WINDOWS_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-hub/claude-windows}
+AFTER=${CLAUDE_HUB_WINDOW_SHELL:-bash}
+DEFAULT_FLAGS=()
+[ "${CLAUDE_HUB_SKIP_PERMISSIONS:-}" = 1 ] && DEFAULT_FLAGS=(--dangerously-skip-permissions)
+case $0 in /*) SELF=$0 ;; *) SELF=$PWD/$0 ;; esac      # how this script was reached, taken before any cd
+WAKE_DEFAULT='Automatic notice, not the user: this session was resumed after its Claude stopped. Anything that was running in the background (commands, agents) was stopped. Before you start any of it again, check what it left behind. Then carry on from where you stopped. If you were asking the user something, ask again.'
+
+acct='' id='' sid='' flags=() watcher='' follower='' lineage_json='[]' recfile=''
+trap 'if [ -n "$id" ]; then stop_follow; record_set reopen=true; fi; exit 0' TERM
+
+read -r BOOT <<< "${CLAUDE_HUB_BOOT_ID:-}"
+[ -n "$BOOT" ] || { read -r BOOT < /proc/sys/kernel/random/boot_id; } 2>/dev/null || BOOT=''
+
+if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+  unset CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_AUTO_COMPACT_WINDOW CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+fi
+while IFS= read -r _name; do unset "$_name"; done < <(compgen -e | grep '^ANTHROPIC_')
+unset _name
+
+claude_as() { CLAUDE_CONFIG_DIR="$ACCTS/$1" claude "${@:2}"; }
+
+claude_view_as() {
+  local shim
+  shim=$(dirname "$(readlink -f "$SELF")")/claude-paste-shim
+  if [ -f "$shim" ] && [ -x "$shim" ]; then
+    CLAUDE_CONFIG_DIR="$ACCTS/$1" "$shim" claude "${@:2}"
+  else
+    claude_as "$@"
+  fi
+}
+
+claude_list() {
+  local t=${CLAUDE_HUB_AGENTS_TIMEOUT:-15}
+  case $t in ''|*[!0-9]*) t=15 ;; esac
+  t=$((10#$t)); [ "$t" -gt 0 ] || t=15
+  CLAUDE_CONFIG_DIR="$ACCTS/$1" timeout -k 2 "$t" claude agents --json </dev/null
+}
+
+lane_nudge() {
+  [ -z "${CLAUDE_HUB_NO_AGENTS_SLICE:-}" ] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  { ( setsid timeout 5 systemctl --user start --no-block claude-agents-lane.service \
+        </dev/null >/dev/null 2>&1 & ); } 2>/dev/null
+  return 0
+}
+
+record_file() {
+  if [ -n "$recfile" ]; then printf '%s' "$recfile"; else printf '%s/%s.json' "$RECORDS" "${sid:-$id}"; fi
+}
+
+bad_id() {
+  case $1 in
+    */*) printf 'claude-window: "%s" is not a session id (it has a "/" in it)\n' "$1" >&2; exit 2 ;;
+  esac
+  return 0
+}
+
+IFS= read -r -d '' RECORD_PY <<'PY' || true
+import fcntl, json, math, os, re, signal, sys, time
+
+def wait():
+    try:
+        w = float(os.environ.get("CLAUDE_HUB_RECORD_LOCK_WAIT") or 5)
+    except ValueError:
+        return 5.0
+    return w if math.isfinite(w) and w >= 0 else 5.0
+
+def lock(folder):
+    # the lock file, open and locked, or None when it could not be made or was not had in time
+    try:
+        fd = os.open(os.path.join(folder, ".records.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    end = time.monotonic() + wait()
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            pass
+        if not time.monotonic() < end:
+            os.close(fd)
+            return None
+        time.sleep(0.05)
+
+def read(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def write(path, rec):
+    folder, name = os.path.split(path)
+    tmp = os.path.join(folder, "." + name + "." + str(os.getpid()) + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(rec, f, indent=1)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+def boot_began():
+    named = os.environ.get("CLAUDE_HUB_BOOT_EPOCH", "").strip()
+    if named:
+        try:
+            return float(named)
+        except ValueError:
+            pass
+    try:
+        for line in open("/proc/stat"):
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+def live_window(f, me, boot):
+    # True when that record is another live window's: peer_window --file's rule (bash, below), here because a re-key checks it
+    # with the lock held. A record whose wrapper is this one, from another boot, of an earlier boot (no stamp, written before
+    # this boot began) or whose wrapper does not run claude-window any more is nobody's.
+    try:
+        r = json.load(open(f))
+        pid = r["wrapper_pid"]
+        if isinstance(pid, (bool, float)):
+            return False
+        pid = int(pid)
+        stamp = r.get("boot")
+        stamped = isinstance(stamp, str) and bool(stamp)
+        if str(pid) == me or (stamped and boot and stamp != boot):
+            return False
+        if not stamped and boot_began() > 0 and os.path.getmtime(f) < boot_began():
+            return False
+        return b"claude-window" in open("/proc/%d/cmdline" % pid, "rb").read()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+        return False
+
+def alive(pid):
+    # a process that runs: not gone, and not a zombie that nobody has waited for yet
+    try:
+        return open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, ValueError, IndexError):
+        return False
+
+def taken(path, wrapper, boot, new):
+    # True when a record other than this one, and not this wrapper's, is a live window's and already has that session id
+    # (claude-desks keys the records by the field, so two live windows with one value would hide each other)
+    import glob
+    folder = os.path.dirname(path) or "."
+    for f in glob.glob(os.path.join(glob.escape(folder), "*.json")):
+        if os.path.abspath(f) == os.path.abspath(path):
+            continue
+        r = read(f)
+        if isinstance(r, dict) and r.get("session_id") == new and live_window(f, wrapper, boot):
+            return True
+    return False
+
+def wanted(follower):
+    # False when the follower that asked for a re-key has ended: nobody wants it ("-" is no follower, a caller of its own)
+    return not (follower.isdigit() and not alive(int(follower)))
+
+def rekey(path, wrapper, new, boot, follower, short):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", new):       # a session id is one plain word
+        return 1
+    if held is None:
+        return 1
+    if not wanted(follower):                                        # a wait for the lock may have outlived the follower
+        return 1
+    rec = read(path)                                                # again, with the lock held
+    if not isinstance(rec, dict) or str(rec.get("wrapper_pid")) != wrapper or not short or rec.get("id") != short:
+        return 1                                                    # another window's record, or another job's of this wrapper
+    was = rec.get("session_id")
+    if not (isinstance(was, str) and was):
+        name = os.path.basename(path)
+        was = name[:-5] if name.endswith(".json") else name
+    if was == new or taken(path, wrapper, boot, new):
+        return 1
+    ids = []
+    for i in [was] + (rec["lineage"] if isinstance(rec.get("lineage"), list) else []):
+        if isinstance(i, str) and i and i != new and i not in ids:
+            ids.append(i)
+    rec["session_id"], rec["lineage"] = new, ids[:8]
+    try:
+        write(path, rec)
+    except Exception:
+        return 1
+    print(path)
+    return 0
+
+def owned(folder, wrapper, short):
+    import glob
+    best = None
+    for f in glob.glob(os.path.join(glob.escape(folder), "*.json")):
+        r = read(f)
+        if not isinstance(r, dict) or str(r.get("wrapper_pid")) != wrapper or r.get("id") != short:
+            continue
+        sid = r.get("session_id")
+        if not (isinstance(sid, str) and sid):
+            continue
+        try:
+            when = os.path.getmtime(f)
+        except OSError:
+            continue
+        if best is None or when > best[0]:
+            best = (when, sid, r.get("lineage") if isinstance(r.get("lineage"), list) else [], f)
+    if best is None:
+        return 1
+    print(best[1])
+    print(json.dumps(best[2]))
+    print(best[3])
+    return 0
+
+mode, path = sys.argv[1], sys.argv[2]
+if mode == "rekey":
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, signal.SIG_IGN)
+    follower = sys.argv[6] if len(sys.argv) > 6 else "-"
+    short = sys.argv[7] if len(sys.argv) > 7 else ""
+    if not wanted(follower):                                    # asked for by a follower that has ended: no lock to wait for
+        sys.exit(1)
+held = lock(os.path.dirname(path) or ".")       # kept open, so held, until this process ends
+rec = read(path)
+if mode == "set":
+    for pair in sys.argv[3:]:
+        k, v = pair.split("=", 1)
+        rec[k] = json.loads(v)
+    write(path, rec)
+elif mode == "rekey":
+    sys.exit(rekey(path, sys.argv[3], sys.argv[4], sys.argv[5], follower, short))
+elif mode == "drop":
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+elif mode == "owned":
+    sys.exit(owned(os.path.dirname(path) or ".", sys.argv[3], sys.argv[4]))
+else:
+    sw = rec.get("switch") if isinstance(rec, dict) else None
+    if isinstance(sw, dict) and sw.get("account"):
+        p = sw.get("prompt")
+        p = re.sub(r"\r\n|\r|\n", " ", p) if isinstance(p, str) and p.strip() else ""
+        rec["switch"] = None
+        try:
+            write(path, rec)
+        except Exception:
+            pass
+        print(sw["account"], sw.get("model") or "-", "1" if sw.get("continue") else "-", sw.get("effort") or "-")
+        print(p)
+        bk = sw.get("back")
+        ba = bk.get("account") if isinstance(bk, dict) else None
+        if isinstance(ba, str) and ba and len(ba.split()) == 1:
+            def word(v):
+                return v if isinstance(v, str) and v and len(v.split()) == 1 else "-"
+            bp = bk.get("prompt")
+            bp = re.sub(r"\r\n|\r|\n", " ", bp) if isinstance(bp, str) and bp.strip() else ""
+            print(ba, word(bk.get("model")), word(bk.get("effort")))
+            print(bp)
+        else:
+            print("- - -")
+            print()
+    else:
+        print("- - - -")
+        print()
+        print("- - -")
+        print()
+PY
+
+record_set() {
+  mkdir -p "$RECORDS"
+  python3 -c "$RECORD_PY" set "$(record_file)" "$@"
+}
+
+take_switch() { python3 -c "$RECORD_PY" take "$(record_file)" 2>/dev/null; }
+
+record_drop() { python3 -c "$RECORD_PY" drop "$(record_file)" 2>/dev/null; }
+
+owned_record() { python3 -c "$RECORD_PY" owned "$RECORDS/.owned" "$1" "$2" 2>/dev/null; }
+
+adopt_rekey() {
+  [ -n "$recfile" ] || return 0
+  local got_sid got_lineage
+  got_sid=$(record_get session_id)
+  [ -n "$got_sid" ] && [ "$got_sid" != "${sid:-$id}" ] || return 0
+  got_lineage=$(record_get lineage)
+  sid=$got_sid lineage_json=${got_lineage:-[]}
+}
+
+record_get() { record_get_from "$(record_file)" "$1"; }   # record_get key  -> value as plain text ('' when missing/null)
+record_get_from() {      # record_get_from file key  -> the same, from any record file
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get(sys.argv[2])
+except Exception:
+    v = None
+if v is None: print("")
+elif isinstance(v, (dict, list)): print(json.dumps(v))
+else: print(v)
+PY
+}
+
+json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+json_arr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@"; }
+
+lineage_list() {
+  python3 - "$lineage_json" "$@" <<'PY'
+import json, os, sys
+try:
+    old = json.loads(sys.argv[1])
+except Exception:
+    old = []
+own, ids = sys.argv[2], []
+for i in sys.argv[3:] + (old if isinstance(old, list) else []):
+    if isinstance(i, str) and i and i != own and i not in ids:
+        ids.append(i)
+keep = os.environ.get("LINEAGE_KEEP", "")
+if keep in ids[8:]:
+    ids = ids[:7] + [keep]
+print(json.dumps(ids[:8]))
+PY
+}
+
+find_record() {
+  python3 - "$RECORDS" "$1" <<'PY' 2>/dev/null
+import glob, json, os, sys
+records, sid = sys.argv[1], sys.argv[2]
+exact = os.path.join(records, sid + ".json")
+older = None
+for path in sorted(glob.glob(os.path.join(records, "*.json"))):
+    try:
+        rec = json.load(open(path))
+    except Exception:
+        continue
+    if not isinstance(rec, dict):
+        continue
+    if rec.get("session_id") == sid:
+        print(path)
+        raise SystemExit
+    lineage = rec.get("lineage")
+    if older is None and isinstance(lineage, list) and sid in lineage:
+        older = path
+if os.path.exists(exact):
+    print(exact)
+elif older:
+    print(older)
+PY
+}
+
+job_record() {
+  python3 - "$RECORDS" "$1" "$2" <<'PY' 2>/dev/null
+import glob, json, os, sys
+records, acct, short = sys.argv[1:4]
+best = None
+for path in glob.glob(os.path.join(glob.escape(records), "*.json")):
+    try:
+        rec = json.load(open(path))
+        when = os.path.getmtime(path)
+    except Exception:
+        continue
+    if isinstance(rec, dict) and rec.get("account") == acct and rec.get("id") == short and (best is None or when > best[0]):
+        best = (when, path)
+if best:
+    print(best[1])
+PY
+}
+
+candidate_ids() {
+  python3 -c '
+import json, sys
+try:
+    lineage = json.loads(sys.argv[2])
+except Exception:
+    lineage = []
+seen = []
+for i in [sys.argv[1]] + (lineage if isinstance(lineage, list) else []) + [sys.argv[3]]:
+    if isinstance(i, str) and i and i not in seen:
+        seen.append(i)
+print("\n".join(seen))' "$1" "$2" "$3"
+}
+
+usable_session() {
+  python3 - "$ACCTS" "$@" <<'PY' 2>/dev/null
+import glob, os, sys
+accts, acct = sys.argv[1], sys.argv[2]
+for i in sys.argv[3:]:
+    if i and glob.glob(os.path.join(glob.escape(accts), glob.escape(acct), "projects", "*", glob.escape(i) + ".jsonl")):
+        print(i)
+        break
+PY
+}
+
+session_cwd() {
+  python3 - "$ACCTS" "$@" <<'PY' 2>/dev/null
+import glob, json, os, re, sys
+accts, acct, sid = sys.argv[1:4]
+best = None
+for path in sorted(glob.glob(os.path.join(glob.escape(accts), glob.escape(acct), "projects", "*", glob.escape(sid) + ".jsonl"))):
+    try:
+        st = os.stat(path)
+    except OSError:
+        continue
+    if best is None or (st.st_mtime, st.st_size) > best[0]:
+        best = ((st.st_mtime, st.st_size), path)
+if best is None:
+    sys.exit(0)
+path, size = best[1], 1 << 20
+folder = os.path.basename(os.path.dirname(path))
+try:
+    with open(path, "rb") as f:
+        end = f.seek(0, os.SEEK_END)
+        f.seek(max(0, end - size))
+        rows = f.read().decode("utf-8", "replace").splitlines()
+except OSError:
+    sys.exit(0)
+for line in reversed(rows[1:] if len(rows) > 1 and end > size else rows):
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    cwd = row.get("cwd") if isinstance(row, dict) else None
+    if isinstance(cwd, str) and cwd and os.path.isabs(cwd) and re.sub(r"[^A-Za-z0-9]", "-", cwd) == folder and os.path.isdir(cwd):
+        print(cwd)
+        break
+PY
+}
+
+claimed_ids=()
+claims() {               # claims take|release <id>…  -> take exits 3 (and keeps none) when a live window holds one
+  python3 - "$RECORDS" "$$" "${BOOT:--}" "$@" <<'PY' 2>/dev/null
+import fcntl, os, sys, time
+records, me, boot, mode, ids = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+os.makedirs(records, exist_ok=True)
+lock = os.open(os.path.join(records, ".claims.lock"), os.O_CREAT | os.O_RDWR, 0o644)
+for _ in range(100):                      # one pass at a time; give up on the lock after five seconds and go on
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        time.sleep(0.05)
+
+def path(i):
+    return os.path.join(records, ".claim-%s.lock" % i)
+
+def mine(p):
+    try:
+        return open(p).read().split()[0] == me
+    except (OSError, IndexError):
+        return False
+
+def live(p):
+    try:
+        pid, owner_boot, when = open(p).read().split()
+        cmd = open("/proc/%d/cmdline" % int(pid), "rb").read()
+        other_boot = "-" not in (owner_boot, boot) and owner_boot != boot      # "-" is a boot nobody could read
+        return b"claude-window" in cmd and not other_boot and time.time() - int(when) < 300
+    except (OSError, ValueError):
+        return False
+
+def drop(p):
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+if mode == "release":
+    for i in ids:
+        if mine(path(i)):
+            drop(path(i))
+    sys.exit(0)
+got = []
+for i in ids:
+    p = path(i)
+    if os.path.lexists(p):                # lexists: a link whose target is gone is a leftover too
+        if not os.path.islink(p) and not mine(p) and live(p):      # a link is never a claim: mine() and live() would read its target
+            for g in got:
+                drop(path(g))
+            sys.exit(3)
+        drop(p)                           # stale (its window is gone, is not a window, or is old), or already ours
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        if os.path.isfile(p) and not os.path.islink(p):      # another window took the name since the check above
+            for g in got:
+                drop(path(g))
+            sys.exit(3)
+        continue                          # a link or a directory that could not be removed cannot hold a claim: go on without
+    os.write(fd, ("%s %s %d\n" % (me, boot, time.time())).encode())
+    os.close(fd)
+    got.append(i)
+# A window killed outright (SIGKILL), or one whose TERM ends the claims program half-way, leaves claims behind: tidy
+# every claim that is not live. (SIGHUP and a TERM sent after the take has returned reach this script's EXIT trap, which
+# releases them. A TERM sent while the take runs reaches it with no ids to release; the next take tidies that claim.)
+for n in os.listdir(records):
+    if n.startswith(".claim-") and n.endswith(".lock") and n[7:-5] not in ids and not live(os.path.join(records, n)):
+        drop(os.path.join(records, n))
+PY
+}
+release_claims() { [ ${#claimed_ids[@]} -eq 0 ] || claims release "${claimed_ids[@]}"; claimed_ids=(); }
+trap release_claims EXIT
+
+peer_window() {
+  python3 - "$RECORDS" "$$" "$BOOT" "$@" <<'PY' 2>/dev/null
+import glob, json, os, sys
+records, me, boot, ids = sys.argv[1], sys.argv[2], sys.argv[3], set(sys.argv[4:])
+only = None
+if sys.argv[4:5] == ["--file"]:
+    only = sys.argv[5] if len(sys.argv) > 5 else ""
+
+
+def boot_began():
+    named = os.environ.get("CLAUDE_HUB_BOOT_EPOCH", "").strip()
+    if named:
+        try:
+            return float(named)
+        except ValueError:
+            pass
+    try:
+        for line in open("/proc/stat"):
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+began = boot_began()
+for f in ([only] if only is not None else sorted(glob.glob(records + "/*.json"))):
+    try:
+        r = json.load(open(f))
+        pid = r["wrapper_pid"]
+        if isinstance(pid, (bool, float)):         # not a pid: int() would make one of True and of 12.0
+            continue
+        pid = int(pid)
+        stamp = r.get("boot")
+        stamped = isinstance(stamp, str) and bool(stamp)
+        if str(pid) == me or (stamped and boot and stamp != boot):
+            continue
+        if not stamped and began > 0 and os.path.getmtime(f) < began:
+            continue
+        if b"claude-window" not in open("/proc/%d/cmdline" % pid, "rb").read():
+            continue
+        shown = {r.get("session_id"), r.get("id")} | set(i for i in r.get("lineage") or [] if isinstance(i, str))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+        continue
+    if only is not None or ids & shown:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+konsole_pid() {          # the Konsole this tab belongs to, walking up from here
+  local p=$$ c
+  while [ "${p:-0}" -gt 1 ]; do
+    c=$(cat "/proc/$p/comm" 2>/dev/null)
+    [ "$c" = konsole ] && { echo "$p"; return; }
+    p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+  done
+  echo 0
+}
+
+refuse_attach() {        # this window does not show a Claude another window shows: one line, a shell, nothing touched
+  release_claims
+  printf '\nAnother window already shows %s on %s, so this window did not attach to it. Its record was left as it was. Close the other window first if this is the one to use.\n' "${sid:-$id}" "$acct"
+  exec $AFTER
+}
+
+record_attached() {
+  [ -n "$recfile" ] || recfile=$RECORDS/${sid:-$id}.json
+  if [ -e "$(record_file)" ] && peer_window --file "$(record_file)"; then
+    refuse_attach
+  fi
+  record_set account="$(json_str "$acct")" id="$(json_str "$id")" session_id="$(json_str "${sid:-$id}")" \
+    lineage="$(lineage_list "${sid:-$id}")" boot="$(json_str "$BOOT")" \
+    flags="$(json_arr "${flags[@]}")" wrapper_pid="$$" konsole_pid="$(konsole_pid)" \
+    konsole_service="$(json_str "${KONSOLE_DBUS_SERVICE:-}")" \
+    konsole_session="$(json_str "${KONSOLE_DBUS_SESSION:-}")" \
+    konsole_window="$(json_str "${KONSOLE_DBUS_WINDOW:-}")" \
+    attached_at="$(date +%s)" reopen=false follows_back=true
+  release_claims        # the record now says the conversation is shown, which is what the next window looks for
+  [ -n "$(record_get cwd)" ] || record_set cwd="$(json_str "$PWD")"
+}
+
+
+bg_ids() {               # bg_ids <account> -> its live background ids, one per line; fails unread
+  claude_list "$1" 2>/dev/null | python3 -c '
+import json, sys
+try: rows = json.load(sys.stdin)
+except Exception: sys.exit(1)
+if not isinstance(rows, list): sys.exit(1)
+for r in rows:
+    if isinstance(r, dict) and r.get("kind") == "background" and r.get("id") and r.get("status") \
+       and r.get("state") != "stopped":
+        print(r["id"])'
+}
+
+bg_id_in_message() {
+  python3 - "$@" <<'PY'
+import os, re, sys
+# the bytes as Claude Code wrote them, read as UTF-8 whatever this shell's locale is (the success line holds a non-ASCII dot)
+text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", os.fsencode(sys.argv[1]).decode("utf-8", "replace"))
+lines = text.splitlines()
+for line in lines[:1] if sys.argv[2:] == ["first"] else lines:
+    m = re.match(r"[ \t]*backgrounded[ \t]+\u00b7[ \t]+([0-9a-f]{8})(?![A-Za-z0-9])", line)
+    if m:
+        print(m.group(1))
+        break
+PY
+}
+
+bg_confirm() {
+  claude_list "$1" 2>/dev/null | python3 -c '
+import json, os, sys
+named, before = sys.argv[1], sys.argv[2]
+try: rows = json.load(sys.stdin)
+except Exception: sys.exit(1)
+if not isinstance(rows, list): sys.exit(1)
+live = [r for r in rows if isinstance(r, dict) and r.get("kind") == "background" and r.get("id")
+        and r.get("status") and r.get("state") != "stopped"]
+by_id = {r["id"]: r for r in live}
+if named and named in by_id:
+    print(named); sys.exit(0)
+if named:                               # its own row is not listed yet: no other row is its row
+    sys.exit(1)
+if before == "?":                       # no usable "before": a stranger must not be adopted
+    sys.exit(1)
+fresh = [r for r in live if r["id"] not in set(before.split())]
+here = os.getcwd()
+pick = [r for r in fresh if r.get("cwd") == here] or fresh
+if pick:
+    pick.sort(key=lambda r: r.get("startedAt") or 0)
+    print(pick[-1]["id"]); sys.exit(0)
+sys.exit(1)' "$2" "$3"
+}
+
+wake_message() {
+  local mode=${CLAUDE_HUB_WAKE:-pending} helper=${CLAUDE_HUB_TRANSCRIPT_STATE:-} word='' text
+  [ "$mode" != never ] || return 0
+  [ -n "$helper" ] || helper=$(dirname "$(readlink -f "$SELF")")/claude-session-state
+  [ -x "$helper" ] || return 0
+  word=$(timeout -k 2 "${CLAUDE_HUB_STATE_TIMEOUT:-20}" "$helper" "$1" "$2" </dev/null 2>/dev/null) || return 0
+  read -r word <<< "$word"; word=${word//[[:space:]]/}
+  case "$word" in
+    interrupted|question|waiting) ;;
+    empty|done) [ "$mode" = all ] || return 0 ;;
+    *) return 0 ;;                     # missing, or a word nobody knows
+  esac
+  text=${CLAUDE_HUB_WAKE_MESSAGE:-$WAKE_DEFAULT}
+  case $text in -*) text=" $text" ;; esac    # it is the last argument of the start: one starting with "-" is an option
+  printf '%s\n' "$text"
+}
+
+start_bg() {             # start_bg <account> [extra args…] -> prints the short id, or fails
+  local acct=$1 out err errf ew er said named before id n lk rc looks until_us wait_s refused=''
+  local bg_t bg_wrap
+  local -a bg_time
+  mkdir -p "$RECORDS"
+  if exec {lk}>>"$RECORDS/.bg-start-$acct.lock"; then
+    flock -w "${CLAUDE_HUB_BG_LOCK_WAIT:-120}" "$lk" || true
+  fi
+  if [ -e "$ACCTS/$acct/.claude-paused" ]; then
+    printf 'claude-window: the account %s is paused\n' "$acct" >&2
+    return 1
+  fi
+  before=$(bg_ids "$acct" {lk}>&-) || before='?'
+  errf=$(mktemp --tmpdir claude-bg.XXXXXX 2>/dev/null) || errf=''
+  if [ -n "$errf" ] && exec {ew}>"$errf"; then
+    exec {er}<"$errf" || exec {er}</dev/null
+  else
+    exec {ew}>&2 {er}</dev/null
+  fi
+  [ -z "$errf" ] || rm -f -- "$errf"
+  bg_t=${CLAUDE_HUB_BG_TIMEOUT:-60}
+  bg_wrap=$(dirname "$(readlink -f "$SELF")")/claude-timeout
+  bg_time=(timeout "$bg_t")
+  if [[ $bg_t =~ ^([0-9]+\.?[0-9]*|\.[0-9]+)$ && $bg_t =~ [1-9] && -f $bg_wrap && -x $bg_wrap ]] && command -v setsid >/dev/null 2>&1; then
+    bg_time=(setsid -w "$bg_wrap" "$bg_t" --)
+  fi
+  out=$(CLAUDE_CONFIG_DIR="$ACCTS/$acct" "${bg_time[@]}" \
+        claude --bg "${flags[@]}" "${@:2}" </dev/null 2>&"$ew" {ew}>&- {er}<&- {lk}>&-)
+  rc=$?
+  err=$(cat <&"$er")
+  exec {ew}>&- {er}<&-
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -le 128 ]; then
+    refused=1 before='?'
+  fi
+  lane_nudge {lk}>&-
+  named=$(bg_id_in_message "$out" ${refused:+first})
+  looks=${CLAUDE_HUB_BG_CONFIRM:-}; case $looks in *[!0-9]*) looks='' ;; esac
+  until_us=''
+  if [ -z "$looks" ] && { [ -n "$named" ] || { [ -z "$refused" ] && [ "$before" != '?' ]; }; }; then
+    wait_s=${CLAUDE_HUB_BG_NAMED_WAIT:-15}; case $wait_s in ''|*[!0-9]*) wait_s=15 ;; esac
+    until_us=$(( ${EPOCHREALTIME//[.,]/} + 10#$wait_s * 1000000 ))
+  fi
+  looks=${looks:-6}
+  [ -n "$named" ] || [ "$before" != '?' ] || looks=0
+  n=0
+  while [ -n "$until_us" ] || [ "$n" -lt "$looks" ]; do
+    [ "$n" -eq 0 ] || sleep 0.4        # the list can lag the daemon by a moment
+    if id=$(bg_confirm "$acct" "$named" "$before" {lk}>&-) && [ -n "$id" ]; then
+      printf '%s\n' "$id"; return 0
+    fi
+    n=$((n + 1))
+    [ -z "$until_us" ] || [ "${EPOCHREALTIME//[.,]/}" -lt "$until_us" ] || break
+  done
+  [ -n "$named" ] && { printf '%s\n' "$named"; return 0; }
+  said=$err
+  [ -z "$out" ] || said=${said:+$said$'\n'}$out
+  if [ -n "$refused" ]; then
+    printf 'claude-window: background start for %s was refused (exit %s):\n%s\n' "$acct" "$rc" "$said" >&2
+    return 1
+  fi
+  if [ -n "$said" ]; then
+    printf 'claude-window: background start for %s produced no session:\n%s\n' "$acct" "$said" >&2
+  fi
+  return 2
+}
+
+refuse_if_shown() {
+  peer_window "$2" ${3:+"$3"} || return 0
+  [ "${4:-}" != keep ] || record_set reopen=true
+  release_claims
+  printf '\nThe Claude this start came back with (%s on %s) is already open in another window, so this window did not attach to it.' "$2" "$1"
+  if [ "${4:-}" = new ]; then
+    printf ' It is listed by claude agents; claude attach %s shows it once the other window is closed.\n' "$2"
+  else
+    printf ' If a Claude of this window runs without one, claude agents lists it and the reopen tool finds the conversation again.\n'
+  fi
+  exec $AFTER
+}
+
+session_id_of() {        # session_id_of <account> <short id> -> full session id ('' if unknown)
+  claude_list "$1" 2>/dev/null | python3 -c '
+import json, sys
+try: rows = json.load(sys.stdin)
+except Exception: rows = []
+print(next((r.get("sessionId") or "" for r in rows if r.get("id") == sys.argv[1]), ""))' "$2"
+}
+
+job_session_id() {
+  local f=$ACCTS/$1/jobs/$2/state.json line v
+  local -a lines=()
+  jsid=''
+  [ -f "$f" ] && [ -r "$f" ] || return 1
+  { mapfile -t lines < "$f"; } 2>/dev/null || lines=()
+  for line in "${lines[@]}"; do
+    case $line in
+      '  "sessionId": "'*'"'*)
+        v=${line#'  "sessionId": "'}
+        v=${v%%'"'*}
+        case $v in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) ;; *) jsid=$v ;; esac
+        break
+        ;;
+    esac
+  done
+  [ -z "$jsid" ] || return 0
+  jsid=$(python3 -c '
+import json, re, sys
+try: v = json.load(open(sys.argv[1])).get("sessionId")
+except Exception: v = None
+print(v if isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", v) else "")' "$f" 2>/dev/null) || jsid=''
+  [ -n "$jsid" ]
+}
+
+session_state() {
+  local out
+  out=$(claude_list "$1" 2>/dev/null) || { echo unknown; return 0; }
+  python3 -c '
+import json, sys
+try: rows = json.loads(sys.stdin.read())
+except Exception: print("unknown"); sys.exit(0)
+if not isinstance(rows, list): print("unknown"); sys.exit(0)
+print("running" if any(isinstance(r, dict) and r.get("id") == sys.argv[1] and r.get("status") for r in rows) else "gone")' \
+    "$2" <<< "$out" || echo unknown
+}
+
+session_look() {
+  local n state=unknown
+  for ((n = 0; n < ${CLAUDE_HUB_LOOK_TRIES:-5}; n++)); do
+    [ "$n" -eq 0 ] || sleep 0.5
+    state=$(session_state "$1" "$2")
+    [ "$state" = unknown ] || break
+  done
+  printf '%s\n' "$state"
+}
+
+stop_or_keep() {
+  if claude_as "$acct" stop "$id" >/dev/null 2>&1; then
+    record_drop
+  else
+    record_set reopen=true
+  fi
+}
+
+logging_out() {
+  [ -n "${CLAUDE_HUB_WINDOW_LOGOUT:-}" ] && return 0
+  local v
+  v=$(timeout 3 qdbus6 org.kde.ksmserver /KSMServer org.kde.KSMServerInterface.isShuttingDown 2>/dev/null) || return 0
+  [ "$v" = true ] && return 0
+  if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$WAYLAND_DISPLAY" ] || return 0
+  elif [ -n "${DISPLAY:-}" ]; then
+    timeout 3 xdpyinfo >/dev/null 2>&1 || return 0
+  fi
+  return 1
+}
+
+foreground() {           # foreground <account> [extra args…]
+  stop_watch
+  if [ -e "$ACCTS/$1/.claude-paused" ]; then
+    printf '\nclaude-window: the account %s is paused, so no Claude was started on it.\n' "$1"
+    release_claims
+    exec $AFTER
+  fi
+  local rc
+  if [ -z "${CLAUDE_HUB_NO_AGENTS_SLICE:-}" ]; then
+    ( sleep 2; lane_nudge ) </dev/null >/dev/null 2>&1 &
+  fi
+  claude_as "$1" "${flags[@]}" "${@:2}"
+  rc=$?
+  [ "$rc" -eq 0 ] || printf '\nClaude exited (%s).\n' "$rc"
+  release_claims        # exec skips the EXIT trap
+  exec $AFTER
+}
+
+start_watch() {
+  stop_watch
+  setsid "$SELF" watch "$$" </dev/null >/dev/null 2>&1 &     # not "$0": a start can change the folder a relative one is relative to
+  watcher=$!
+  setsid "$SELF" follow "$$" "$acct" "$id" </dev/null >/dev/null 2>&1 &     # the follower, with the same life as the watcher
+  follower=$!
+}
+stop_watch() { [ -n "$watcher" ] && kill "$watcher" 2>/dev/null; watcher=''; stop_follow; }
+stop_follow() {
+  [ -n "$follower" ] || return 0
+  local n
+  kill "$follower" 2>/dev/null
+  wait "$follower" 2>/dev/null
+  for ((n = 0; n < 20; n++)); do
+    pgrep -s "$follower" >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  follower=''
+}
+
+kill_tree() {            # kill_tree <pid>: every process below that one, deepest first
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; kill "$c" 2>/dev/null; done
+}
+
+follow_loop() {          # follow_loop <wrapper pid> <account> <short id>
+  local w=$1 a=$2 i=$3 every=${CLAUDE_HUB_FOLLOW_EVERY:-15} whole frac='' every_us until_us slice=1 tp=''
+  local check=${CLAUDE_HUB_FOLLOW_CHECK:-300} check_us check_at now tmo rc via fd='' tailpid='' caught='' cli_only='' jsid='' term=''
+  case $every in ''|*[!0-9.]*|*.*.*) every=15 ;; esac
+  whole=${every%%.*}
+  case $every in *.*) frac=${every#*.} ;; esac
+  frac=${frac}000000; frac=${frac:0:6}
+  every_us=$((10#${whole:-0} * 1000000 + 10#$frac))
+  [ "$every_us" -gt 0 ] || { every=15; every_us=15000000; }
+  [ "$every_us" -ge 1000000 ] || slice=$every
+  printf -v tmo '%d.%06d' $((every_us / 1000000)) $((every_us % 1000000))
+  case $check in ''|*[!0-9]*) check=300 ;; esac                 # whole seconds, 0 or more
+  check_us=$((10#$check * 1000000))
+  [ "$check_us" -gt 0 ] || cli_only=1                           # no check interval: the list on every look, the file never read
+  trap '[ -n "$term" ] || { term=1; kill "$tailpid" 2>/dev/null; }' TERM
+  check_at=$((${EPOCHREALTIME//[.,]/} + check_us))
+  if exec {fd}< <(tail --use-polling -s 1 --pid="$w" -f /dev/null 2>/dev/null); then tailpid=$!; else fd=''; fi
+  while [ -z "$term" ] && kill -0 "$w" 2>/dev/null; do
+    if [ -n "$fd" ]; then
+      read -r -t "$tmo" -u "$fd"; rc=$?
+      [ -z "$term" ] || break
+      if [ "$rc" -le 128 ]; then                                # the tail has ended (no output is ever read from it)
+        kill -0 "$w" 2>/dev/null || break
+        exec {fd}<&-; fd=''; tailpid=''                         # but the wrapper has not: wait in slices from now on
+        continue
+      fi
+    else
+      until_us=$((${EPOCHREALTIME//[.,]/} + every_us))
+      while [ "${EPOCHREALTIME//[.,]/}" -lt "$until_us" ]; do
+        [ -z "$term" ] || break 2
+        kill -0 "$w" 2>/dev/null || break 2
+        sleep "$slice" & tp=$!
+        wait "$tp"
+      done
+    fi
+    [ -z "$term" ] || break
+    kill -0 "$w" 2>/dev/null || break
+    now=${EPOCHREALTIME//[.,]/}
+    via=cli
+    if [ -z "$cli_only" ] && job_session_id "$a" "$i"; then
+      if [ "$now" -ge "$check_at" ]; then via=check; check_at=$((now + check_us))
+      elif [ "$jsid" = "$caught" ]; then continue
+      else via=file
+      fi
+    fi
+    [ -z "$term" ] || break                                     # a TERM came while the job file was read
+    (
+      owned=$(owned_record "$w" "$i") || exit 0
+      cur='' file='' new='' st=0 moved=''
+      { IFS= read -r cur; IFS= read -r _; IFS= read -r file; } <<< "$owned"
+      [ -n "$cur" ] && [ -n "$file" ] || exit 0
+      if [ "$via" = file ]; then
+        new=$jsid
+      else
+        new=$(session_id_of "$a" "$i")
+        kill -0 "$w" 2>/dev/null || exit 0          # the list took long and the window ended meanwhile: the watcher decides now
+        if [ "$via" = check ] && [ -n "$new" ] && [ "$new" != "$jsid" ]; then
+          if job_session_id "$a" "$i"; then
+            if [ "$jsid" = "$new" ]; then
+              moved=1                               # the file has caught up with the list: no disagreement, and the follower's own $jsid is stale
+            else
+              logger -t claude-window -- "follow $i on $a: its state.json names session $jsid but claude agents names $new; the list alone from now on" >/dev/null 2>&1
+              st=21                                 # the list wins and the file is not read again
+            fi
+          else
+            moved=1                                 # the file cannot be used now (gone or cut short): the list wins this look only, no disagreement
+          fi
+        fi
+      fi
+      [ -n "$new" ] || exit "$st"
+      if [ "$new" = "$cur" ]; then
+        [ "$st" -eq 0 ] && [ -z "$moved" ] && [ "$via" != cli ] && [ "$new" = "$jsid" ] && st=20      # the record holds the job's id: caught up
+        exit "$st"
+      fi
+      kill -0 "$w" 2>/dev/null || exit "$st"
+      python3 -c "$RECORD_PY" rekey "$file" "$w" "$new" "$BOOT" "$$" "$i" >/dev/null 2>&1
+      exit "$st"
+    ) &
+    tp=$!
+    wait "$tp"; rc=$?
+    [ -z "$term" ] || break
+    case $rc in
+      20) caught=$jsid ;;
+      21) cli_only=1; caught='' ;;
+      *) caught='' ;;                                           # not caught up, or nothing learned: the next look looks again
+    esac
+  done
+  kill_tree $$
+  [ -z "$term" ] || exit 0                                      # ended by TERM
+  return 0
+}
+
+watch_decide() {         # watch_decide <wrapper pid>
+  local w=$1 f tp=''
+  trap '[ -n "$tp" ] && kill "$tp" 2>/dev/null; exit 0' TERM
+
+  tail --use-polling -s 0.3 --pid="$w" -f /dev/null 2>/dev/null &
+  tp=$!
+  wait "$tp"
+
+  while kill -0 "$w" 2>/dev/null; do
+    sleep 0.3 &
+    tp=$!
+    wait "$tp"
+  done
+
+  f=$(python3 - "$RECORDS" "$w" <<'PY' 2>/dev/null
+import glob, json, sys
+for f in sorted(glob.glob(sys.argv[1] + "/*.json")):
+    try:
+        r = json.load(open(f))
+    except Exception:
+        continue
+    if str(r.get("wrapper_pid")) == sys.argv[2] and not r.get("reopen"):
+        print(f)
+        break
+PY
+)
+  [ -n "$f" ] || exit 0
+  recfile=$f             # the file itself, whatever session id it is named by or holds: the name is no key to the record
+  if logging_out; then
+    record_set reopen=true
+    exit 0
+  fi
+  acct=$(record_get account) id=$(record_get id)
+  if [ -n "$acct" ] && [ -n "$id" ]; then stop_or_keep; else record_drop; fi
+}
+
+attach_loop() {
+  local rc tries=0
+  while :; do
+    record_attached
+    start_watch
+    claude_view_as "$acct" attach "$id"
+    rc=$?
+    stop_watch                           # the view ended with this tab still here: decide here
+    adopt_rekey                          # the conversation may have a new session id: $sid and the lineage take it from the record
+
+    if logging_out; then
+      record_set reopen=true
+      exit 0
+    fi
+
+    local to sw_model sw_cont sw_effort sw_prompt bk bk_model bk_effort bk_prompt
+    { read -r to sw_model sw_cont sw_effort; IFS= read -r sw_prompt; read -r bk bk_model bk_effort; IFS= read -r bk_prompt; } < <(take_switch)
+    [ "$to" = "-" ] && to=''
+    case $bk in ''|-|.|..|*/*) bk='' ;; *) { [ -d "$ACCTS/$bk" ] && [ "$bk" != "$to" ]; } || bk='' ;; esac
+    if [ -n "$to" ]; then
+      local new nsid extra=() dir
+      [ "$sw_model" != "-" ] && extra+=(--model "$sw_model")
+      [ "$sw_effort" != "-" ] && extra+=(--effort "$sw_effort")
+      if [ -n "$sw_prompt" ]; then
+        case $sw_prompt in -*) sw_prompt=" $sw_prompt" ;; esac
+        extra+=("$sw_prompt")
+      elif [ "$sw_cont" = "1" ]; then
+        extra+=(continue)
+      fi
+      dir=$(session_cwd "$to" "$sid"); [ -n "$dir" ] && cd -- "$dir" 2>/dev/null
+      if new=$(start_bg "$to" --resume "$sid" "${extra[@]}"); then
+        nsid=$(session_id_of "$to" "$new")
+        refuse_if_shown "$to" "$new" "$nsid" keep
+        record_drop
+        recfile=''                         # the new job gets a record of its own (record_attached)
+        lineage_json=$(lineage_list '' "$sid") || lineage_json='[]'        # the id left behind stays findable
+        acct=$to id=$new tries=0
+        sid=${nsid:-$id}
+        continue
+      fi
+      if [ -n "$bk" ]; then
+        case $(session_look "$acct" "$id") in
+          gone) ;;
+          running)
+            sleep 1
+            case $(session_look "$acct" "$id") in
+              gone) ;;
+              *) tries=0; continue ;;
+            esac ;;
+          *)
+            record_set reopen=true
+            printf '\nThe %s account would not start this Claude, and whether it still runs on %s could not be read, so nothing was started. If it runs there, claude attach %s shows it.\n' \
+              "$to" "$acct" "$id"
+            exec $AFTER ;;
+        esac
+        local bextra=()
+        [ "$bk_model" != "-" ] && bextra+=(--model "$bk_model")
+        [ "$bk_effort" != "-" ] && bextra+=(--effort "$bk_effort")
+        if [ -n "$bk_prompt" ]; then
+          case $bk_prompt in -*) bk_prompt=" $bk_prompt" ;; esac
+          bextra+=("$bk_prompt")
+        fi
+        dir=$(session_cwd "$bk" "$sid"); [ -n "$dir" ] && cd -- "$dir" 2>/dev/null
+        if new=$(start_bg "$bk" --resume "$sid" "${bextra[@]}"); then
+          nsid=$(session_id_of "$bk" "$new")
+          refuse_if_shown "$bk" "$new" "$nsid" keep
+          record_drop
+          recfile=''
+          lineage_json=$(lineage_list '' "$sid") || lineage_json='[]'
+          acct=$bk id=$new tries=0
+          sid=${nsid:-$id}
+          continue
+        fi
+        record_drop
+        foreground "$bk" --resume "$sid" "${bextra[@]}"
+      fi
+      record_drop
+      foreground "$to" --resume "$sid" "${extra[@]}"
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+      local state
+      state=$(session_look "$acct" "$id")
+      if [ "$state" != gone ]; then
+        if [ "$tries" -lt 3 ]; then
+          tries=$((tries + 1)); sleep 1; continue
+        fi
+        record_set reopen=true
+        if [ "$state" = running ]; then
+          printf '\nThis Claude is still running but cannot be shown here (attach exited %s): claude attach %s\n' \
+            "$rc" "$id"
+        else
+          printf '\nThis Claude cannot be shown here (attach exited %s) and the list of Claudes could not be read to tell whether it still runs, so it was not started again: claude attach %s\n' \
+            "$rc" "$id"
+        fi
+        exec $AFTER
+      fi
+      record_drop
+      foreground "$acct" --resume "$sid"
+    fi
+
+    stop_or_keep
+    exec $AFTER
+  done
+}
+
+bg_fail() { python3 -c 'import json,sys; print(json.dumps({"ok": False, "why": sys.argv[1]}))' "$1"; exit 1; }
+bg_partial() {     # bg_partial <why> <account> <bg id>: it started
+  python3 -c 'import json,sys; print(json.dumps({"ok": False, "why": sys.argv[1], "started": True, "account": sys.argv[2], "bg_id": sys.argv[3]}))' "$1" "$2" "$3"
+  exit 2
+}
+bg_unknown() {     # bg_unknown <why> <account>: it was spawned and may have started, no id known
+  python3 -c 'import json,sys; print(json.dumps({"ok": False, "why": sys.argv[1], "started": "unknown", "account": sys.argv[2], "bg_id": None}))' "$1" "$2"
+  exit 2
+}
+
+bg_finish() {
+  local rc=$1 bg_acct=$2 bg_id=$3 bg_sid='' bg_n
+  case $rc in
+    0) ;;
+    1|9) bg_fail "the background Claude did not start on $bg_acct" ;;
+    *) bg_unknown "a background Claude may have started on $bg_acct but it could not be confirmed" "$bg_acct" ;;
+  esac
+  [ -n "$bg_id" ] || bg_unknown "a background Claude may have started on $bg_acct but it could not be confirmed" "$bg_acct"
+  for ((bg_n = 0; bg_n < ${CLAUDE_HUB_BG_CONFIRM:-6}; bg_n++)); do
+    [ "$bg_n" -eq 0 ] || sleep 0.4
+    bg_sid=$(session_id_of "$bg_acct" "$bg_id")
+    [ -z "$bg_sid" ] || break
+  done
+  [ -n "$bg_sid" ] || bg_partial "the Claude started as $bg_id on $bg_acct but its session id could not be read" "$bg_acct" "$bg_id"
+  python3 -c 'import json,sys; print(json.dumps({"ok": True, "account": sys.argv[1], "bg_id": sys.argv[2], "session_id": sys.argv[3]}))' \
+    "$bg_acct" "$bg_id" "$bg_sid"
+  exit 0
+}
+
+bg_conv_state() {
+  local out n state=unknown acct=$1
+  for ((n = 0; n < ${CLAUDE_HUB_LOOK_TRIES:-5}; n++)); do
+    [ "$n" -eq 0 ] || sleep 0.5
+    state=unknown
+    if out=$(claude_list "$acct" 2>/dev/null); then
+      state=$(python3 -c '
+import glob, json, os, re, sys
+try: rows = json.loads(sys.stdin.read())
+except Exception: print("unknown"); sys.exit(0)
+if not isinstance(rows, list): print("unknown"); sys.exit(0)
+accts, acct, usable, ledger = sys.argv[1:5]
+ids = set(sys.argv[5:])
+
+def plain(s):              # a name that can be a file name in the ledger: one plain word, as a session id is
+    return isinstance(s, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", s) is not None
+
+def number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+def first_uuid(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try: row = json.loads(line)
+                except ValueError: continue
+                if isinstance(row, dict) and row.get("type") in ("user", "assistant") and isinstance(row.get("uuid"), str) and row["uuid"]:
+                    return row["uuid"]
+    except OSError:
+        pass
+    return None
+
+def first_uuids(sid):      # every transcript the account holds for that session id (one per project folder)
+    found = glob.glob(os.path.join(glob.escape(accts), glob.escape(acct), "projects", "*", glob.escape(sid) + ".jsonl"))
+    return [u for u in map(first_uuid, sorted(found)) if u]
+
+def load(path):            # a ledger file: its JSON object, or None
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+def began(r):              # when a live session started, in epoch seconds (None: its row does not say)
+    v = r.get("startedAt")
+    return v / 1000.0 if number(v) else None
+
+def keeper_runs(p):        # the keeper that wrote a pending file still runs: its pid, started when the file says, is this script
+    pid, start = p.get("pid"), p.get("pid_start")
+    if not (isinstance(pid, int) and isinstance(start, int)) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            if int(f.read().rsplit(")", 1)[1].split()[19]) != start:
+                return False
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return b"claude-window" in f.read()
+    except (OSError, ValueError, IndexError):
+        return False
+
+live = [r for r in rows if isinstance(r, dict) and r.get("status") and r.get("state") != "stopped"]
+for r in live:
+    if r.get("sessionId") in ids or r.get("id") in ids:
+        print("running", r.get("id") or r.get("sessionId")); sys.exit(0)
+want = (first_uuids(usable) + [None])[0]
+if not plain(want):
+    print("unknown transcript"); sys.exit(0)
+# the starts of this conversation on this account whose outcome was never recorded: (file, when it was about to spawn, keeper runs)
+marks = []
+for path in sorted(glob.glob(os.path.join(glob.escape(ledger), "pending", glob.escape(want) + ".*.json"))):
+    if os.path.basename(path)[:-len(".json")].rsplit(".", 1)[0] != want:
+        continue                           # another uuid that starts with this one and a dot
+    p = load(path)
+    if p is not None and (p.get("account") != acct or p.get("first_uuid") != want):
+        continue
+    at = p.get("at") if p is not None else None
+    if not number(at):                     # a file that cannot be read counts for this account, made when it was last written
+        try:
+            at = os.path.getmtime(path)
+        except OSError:
+            continue
+    marks.append((path, at, p is not None and keeper_runs(p)))
+
+def after(r, at):          # that session can be what a start marked at `at` made
+    b = began(r)
+    return b is None or at <= b + 5
+
+unknown = any(k for _, _, k in marks)
+for r in live:
+    sid = r.get("sessionId")
+    mine = first_uuids(sid) if isinstance(sid, str) and sid else []
+    if want in mine:
+        print("running", r.get("id") or sid); sys.exit(0)
+    if mine:
+        continue                           # its transcript begins with another conversation
+    led = load(os.path.join(ledger, "resumed", sid + ".json")) if plain(sid) else None
+    if led is not None and isinstance(led.get("first_uuid"), str):
+        if led["first_uuid"] == want:
+            print("running", r.get("id") or sid); sys.exit(0)
+        continue                           # a wake of another conversation made it
+    if any(after(r, at) for _, at, _ in marks):
+        unknown = True
+if unknown:
+    print("unknown start"); sys.exit(0)
+for path, at, _ in marks:
+    if not any(after(r, at) for r in live):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+print("none", want)' "$ACCTS" "$acct" "$2" "$3" "${@:4}" <<< "$out") || state=unknown
+    fi
+    [ "$state" = unknown ] || break
+  done
+  printf '%s\n' "$state"
+}
+
+bg_spawned='' bg_tmp='' bg_mv_fds=() bg_spool_fds=() bg_ledger=''
+bg_drop_mover_locks() { local f; for f in ${bg_mv_fds[@]+"${bg_mv_fds[@]}"}; do exec {f}>&-; done; }
+bg_drop_spools() { local f; for f in ${bg_spool_fds[@]+"${bg_spool_fds[@]}"}; do exec {f}>&-; done; }
+
+bg_ledger_write() {
+  python3 - "$@" <<'PY' 2>/dev/null
+import json, os, sys, time
+path, uuid, acct, source, pid = sys.argv[1:6]
+rec = {"first_uuid": uuid, "account": acct, "at": round(time.time(), 3)}
+if source:
+    rec["source"] = source
+if pid:
+    with open("/proc/%d/stat" % int(pid)) as f:
+        rec["pid"], rec["pid_start"] = int(pid), int(f.read().rsplit(")", 1)[1].split()[19])
+tmp = os.path.join(os.path.dirname(path), ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+try:
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+}
+
+bg_keep_start() {
+  local acct=$1 sid=$2 uuid=$3 dir=$4 mark rc=0 new='' new_sid='' n
+  trap ':' TERM HUP
+  mark=$bg_ledger/pending/$uuid.$BASHPID.json
+  bg_ledger_write "$mark" "$uuid" "$acct" '' "$BASHPID" || exit 8
+  new=$(trap ':' TERM HUP; bg_drop_mover_locks; bg_drop_spools
+        if [ -n "$dir" ]; then cd -- "$dir" 2>/dev/null || exit 9; fi
+        start_bg "$acct" --resume "$sid") || rc=$?
+  new=${new%%$'\n'*}
+  case $rc in
+    0)
+      if [ -n "$new" ]; then
+        for ((n = 0; n < ${CLAUDE_HUB_BG_CONFIRM:-6}; n++)); do
+          [ "$n" -eq 0 ] || sleep 0.4
+          new_sid=$(bg_drop_mover_locks; bg_drop_spools; session_id_of "$acct" "$new")
+          [ -z "$new_sid" ] || break
+        done
+      fi
+      if [[ $new_sid =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] &&
+         bg_ledger_write "$bg_ledger/resumed/$new_sid.json" "$uuid" "$acct" "$sid" ''; then
+        rm -f -- "$mark"
+      fi ;;
+    1|9) rm -f -- "$mark" ;;     # `claude --bg` refused, or was never spawned: nothing started
+  esac
+  printf '%s\n%s\n' "$new" "$new_sid"
+  exit "$rc"
+}
+
+bg_on_signal() {
+  trap '' TERM INT HUP
+  [ -z "$bg_tmp" ] || rm -rf -- "$bg_tmp"
+  [ -z "$bg_spawned" ] || bg_unknown "interrupted while a background Claude was starting on $bg_spawned: it may have started" "$bg_spawned"
+  bg_fail "interrupted before anything was started"
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  new)
+    acct=${1:?account}; shift
+    first=''; have_first=''
+    if [ "${1:-}" = "--first-message-file" ]; then
+      first=$(cat "${2:?file}" 2>/dev/null; printf x); first=${first%x}
+      file=$2
+      rm -f "$file"; shift 2
+      if [ -n "$first" ]; then
+        have_first=1
+      else
+        printf 'claude-window: no first message in %s\n' "$file" >&2
+      fi
+    fi
+    flags=("$@"); [ ${#flags[@]} -gt 0 ] || flags=("${DEFAULT_FLAGS[@]}")
+    if [ -n "$have_first" ]; then
+      id=$(start_bg "$acct" "$first") || foreground "$acct" "$first"
+    else
+      id=$(start_bg "$acct") || foreground "$acct"
+    fi
+    sid=$(session_id_of "$acct" "$id")
+    refuse_if_shown "$acct" "$id" "$sid" new
+    attach_loop
+    ;;
+  attach)
+    acct=${1:?account}; id=${2:?id}
+    bad_id "$id"
+    sid=$(session_id_of "$acct" "$id")
+    if [ -z "$sid" ]; then
+      left=$(job_record "$acct" "$id")
+      [ -z "$left" ] || sid=$(record_get_from "$left" session_id)
+      [ -n "$sid" ] || sid=$(basename "$(ls "$RECORDS"/"$id"*.json 2>/dev/null | head -1)" .json)
+    fi
+    names=("$id"); [ -z "$sid" ] || [ "$sid" = "$id" ] || names+=("$sid")
+    claims take "${names[@]}"; claim_rc=$?
+    [ "$claim_rc" -eq 3 ] || claimed_ids=("${names[@]}")
+    if [ "$claim_rc" -eq 3 ] || peer_window "${names[@]}"; then refuse_attach; fi
+    recfile=$(job_record "$acct" "$id")
+    mapfile -t flags < <(python3 -c 'import json,sys; [print(x) for x in json.loads(sys.argv[1] or "[]")]' "$(record_get flags)" 2>/dev/null)
+    [ ${#flags[@]} -gt 0 ] || flags=("${DEFAULT_FLAGS[@]}")
+    lineage_json=$(record_get lineage); [ -n "$lineage_json" ] || lineage_json='[]'
+    if [ -n "$recfile" ] && [ -n "$sid" ]; then
+      prev=$(record_get session_id)
+      [ -z "$prev" ] || [ "$prev" = "$sid" ] || lineage_json=$(lineage_list "$sid" "$prev")
+    fi
+    attach_loop
+    ;;
+  resume)
+    acct=${1:?account}; sid=${2:?session id}
+    bad_id "$sid"
+    found=$(find_record "$sid"); found_sid=''; found_acct=''; cwd=''; flags=()
+    if [ -n "$found" ]; then
+      found_sid=$(record_get_from "$found" session_id)
+      found_acct=$(record_get_from "$found" account)
+      lineage_json=$(record_get_from "$found" lineage); [ -n "$lineage_json" ] || lineage_json='[]'
+      mapfile -t flags < <(python3 -c 'import json,sys; [print(x) for x in json.loads(sys.argv[1] or "[]")]' "$(record_get_from "$found" flags)" 2>/dev/null)
+      cwd=$(record_get_from "$found" cwd)
+    fi
+    [ ${#flags[@]} -gt 0 ] || flags=("${DEFAULT_FLAGS[@]}")
+    [ -n "$cwd" ] && cd -- "$cwd" 2>/dev/null
+    mapfile -t candidates < <(candidate_ids "$found_sid" "$lineage_json" "$sid")
+    case $found_acct in ''|.|..|*/*) found_acct='' ;; *) [ -d "$ACCTS/$found_acct" ] || found_acct='' ;; esac
+    use_acct=${found_acct:-$acct}
+    usable=$(usable_session "$use_acct" "${candidates[@]}")
+    if [ -z "$usable" ] && [ "$use_acct" != "$acct" ]; then
+      use_acct=$acct; usable=$(usable_session "$acct" "${candidates[@]}")
+    fi
+    usable=${usable:-$sid}; acct=$use_acct
+    lineage_json=$(LINEAGE_KEEP=$usable lineage_list '' "${candidates[@]}") || lineage_json='[]'   # newest first, as the candidates are
+    want=("${candidates[@]}")
+    claims take "${want[@]}"; claim_rc=$?
+    [ "$claim_rc" -eq 3 ] || claimed_ids=("${want[@]}")
+    if [ "$claim_rc" -eq 3 ] || peer_window "${want[@]}"; then
+      release_claims
+      printf 'That Claude is already open in another window, so it was not started a second time.\n'
+      exit 0
+    fi
+    dir=$(session_cwd "$acct" "$usable"); [ -n "$dir" ] && cd -- "$dir" 2>/dev/null
+    message=$(wake_message "$acct" "$usable")
+    old_records=("$RECORDS/$sid.json" "$RECORDS/$usable.json"); [ -z "$found" ] || old_records+=("$found")
+    id=$(start_bg "$acct" --resume "$usable" ${message:+"$message"}) || { rm -f "${old_records[@]}"; foreground "$acct" --resume "$usable"; }
+    new_sid=$(session_id_of "$acct" "$id")
+    refuse_if_shown "$acct" "$id" "$new_sid"        # before sid is the new one: nothing of that window's is touched
+    sid=${new_sid:-$usable}
+    rm -f "${old_records[@]}"
+    attach_loop
+    ;;
+  watch)
+    watch_decide "${1:?wrapper pid}"
+    ;;
+  follow)
+    follow_loop "${1:?wrapper pid}" "${2:?account}" "${3:?id}"
+    ;;
+  tab-session)
+    python3 - "$RECORDS" "${1:?tab pid}" <<'PY' | {
+import glob, json, sys
+for f in sorted(glob.glob(sys.argv[1] + "/*.json")):
+    try:
+        r = json.load(open(f))
+    except Exception:
+        continue
+    if str(r.get("wrapper_pid")) == sys.argv[2]:
+        print(r.get("account", ""), r.get("id", ""), r.get("cwd", ""))
+        break
+PY
+      read -r a i c || exit 1
+      pid=$(claude_list "$a" 2>/dev/null | python3 -c '
+import json, sys
+try: rows = json.load(sys.stdin)
+except Exception: rows = []
+print(next((r.get("pid") or "" for r in rows if r.get("id") == sys.argv[1]), ""))' "$i")
+      [ -n "$pid" ] || exit 1
+      printf '%s %s\n' "$pid" "$c"
+    }
+    ;;
+  bg-start)
+    bg_acct=${1:-}; [ -n "$bg_acct" ] || bg_fail "no account given (a name, or auto)"
+    shift
+    bg_cwd='' bg_model='' bg_effort='' bg_file='' bg_plugins=()
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --cwd|--model|--effort|--first-message-file|--plugin-dir)
+          [ $# -ge 2 ] || bg_fail "$1 needs a value"
+          case $1 in
+            --cwd) bg_cwd=$2 ;;
+            --model) bg_model=$2 ;;
+            --effort) bg_effort=$2 ;;
+            --first-message-file) bg_file=$2 ;;
+            --plugin-dir) bg_plugins+=(--plugin-dir "$2") ;;
+          esac
+          shift 2 ;;
+        *) bg_fail "unknown option $1" ;;
+      esac
+    done
+    if [ "$bg_acct" = auto ]; then
+      bg_acct=$(timeout 30 claude-autoswap recommend --model "$bg_model" </dev/null 2>/dev/null | head -n 1) || bg_acct=''
+      bg_acct=${bg_acct//[[:space:]]/}
+      [ -n "$bg_acct" ] || bg_fail "no account has room"
+    fi
+    case $bg_acct in ''|-*|.|..|*/*) bg_fail "\"$bg_acct\" is not an account name" ;; esac
+    [ -d "$ACCTS/$bg_acct" ] || bg_fail "there is no account called $bg_acct"
+    [ ! -e "$ACCTS/$bg_acct/.claude-paused" ] || bg_fail "the account $bg_acct is paused"
+    [ -n "$bg_cwd" ] || bg_fail "no folder given (--cwd)"
+    [ -d "$bg_cwd" ] || bg_fail "the folder $bg_cwd does not exist"
+    case $bg_model in fable|opus|sonnet|haiku) ;; *) bg_fail "the model must be fable, opus, sonnet or haiku" ;; esac
+    case $bg_effort in low|medium|high|xhigh|max) ;; *) bg_fail "the effort must be low, medium, high, xhigh or max" ;; esac
+    [ -n "$bg_file" ] || bg_fail "no first message file given (--first-message-file)"
+    { [ -f "$bg_file" ] && [ -r "$bg_file" ]; } || bg_fail "the first message file $bg_file cannot be read"
+    bg_size=$(stat -c %s -- "$bg_file" 2>/dev/null) || bg_fail "the first message file $bg_file cannot be read"
+    [ "$bg_size" -ge 1 ] || bg_fail "the first message file is empty"
+    [ "$bg_size" -le 100000 ] || bg_fail "the first message is longer than 100,000 bytes"
+    first=$(cat -- "$bg_file" 2>/dev/null; printf x) || bg_fail "the first message file $bg_file cannot be read"
+    first=${first%x}
+    [ -n "$first" ] || bg_fail "the first message is empty"
+    case $first in -*) first=" $first" ;; esac
+    flags=("${DEFAULT_FLAGS[@]}" --model "$bg_model" --effort "$bg_effort" "${bg_plugins[@]}")
+    acct=$bg_acct
+    bg_rc=0
+    bg_new=$(cd -- "$bg_cwd" 2>/dev/null || exit 9; start_bg "$acct" "$first") || bg_rc=$?
+    bg_finish "$bg_rc" "$acct" "$bg_new"
+    ;;
+  bg-resume)
+    trap bg_on_signal TERM INT HUP
+    [ $# -ge 2 ] || bg_fail "usage: bg-resume <account> <session id> [--model M] [--effort E] [--exact]"
+    bg_acct=$1; bg_want=$2; shift 2
+    bg_model='' bg_effort='' bg_model_given='' bg_effort_given='' bg_exact=''     # an option given with an empty value is a bad value, not absent
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --model|--effort)
+          [ $# -ge 2 ] || bg_fail "$1 needs a value"
+          if [ "$1" = --model ]; then bg_model=$2 bg_model_given=1; else bg_effort=$2 bg_effort_given=1; fi
+          shift 2 ;;
+        --exact) bg_exact=1; shift ;;
+        *) bg_fail "usage: bg-resume <account> <session id> [--model M] [--effort E] [--exact]" ;;
+      esac
+    done
+    [ -z "$bg_model_given" ] || case $bg_model in fable|opus|sonnet|haiku) ;; *) bg_fail "the model must be fable, opus, sonnet or haiku" ;; esac
+    [ -z "$bg_effort_given" ] || case $bg_effort in low|medium|high|xhigh|max) ;; *) bg_fail "the effort must be low, medium, high, xhigh or max" ;; esac
+    case $bg_acct in ''|-*|.|..|*/*) bg_fail "\"$bg_acct\" is not an account name" ;; esac
+    [ -d "$ACCTS/$bg_acct" ] || bg_fail "there is no account called $bg_acct"
+    [ ! -e "$ACCTS/$bg_acct/.claude-paused" ] || bg_fail "the account $bg_acct is paused"
+    [[ $bg_want =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || bg_fail "\"$bg_want\" is not a session id"
+    found=$(find_record "$bg_want"); found_sid=''; found_acct=''; bg_dir=''; flags=()
+    if [ -n "$found" ]; then
+      found_sid=$(record_get_from "$found" session_id)
+      found_acct=$(record_get_from "$found" account)
+      lineage_json=$(record_get_from "$found" lineage); [ -n "$lineage_json" ] || lineage_json='[]'
+      mapfile -t flags < <(python3 -c 'import json,sys; [print(x) for x in json.loads(sys.argv[1] or "[]")]' "$(record_get_from "$found" flags)" 2>/dev/null)
+      bg_dir=$(record_get_from "$found" cwd)
+    fi
+    [ ${#flags[@]} -gt 0 ] || flags=("${DEFAULT_FLAGS[@]}")
+    [ -z "$bg_model" ] || flags+=(--model "$bg_model")        # after the record's flags: the last one given wins
+    [ -z "$bg_effort" ] || flags+=(--effort "$bg_effort")
+    mapfile -t candidates < <(candidate_ids "$found_sid" "$lineage_json" "$bg_want")
+    case $found_acct in ''|.|..|-*|*/*) found_acct='' ;; *) { [ -d "$ACCTS/$found_acct" ] && [ ! -e "$ACCTS/$found_acct/.claude-paused" ]; } || found_acct='' ;; esac
+    usable=''; use_acct=$bg_acct
+    if [ -n "$found_acct" ] && [ "$found_acct" != "$bg_acct" ]; then
+      usable=$(usable_session "$found_acct" "${candidates[@]}")
+      [ -z "$usable" ] || use_acct=$found_acct
+    fi
+    [ -n "$usable" ] || usable=$(usable_session "$bg_acct" "${candidates[@]}")
+    [ -n "$usable" ] || bg_fail "there is no transcript of the conversation $bg_want on $bg_acct, so there is nothing to resume"
+    if [ -n "$bg_exact" ] && { [ "$usable" != "$bg_want" ] || [ "$use_acct" != "$bg_acct" ]; }; then
+      bg_fail "exact: the record of $bg_want would resume $usable on $use_acct, not $bg_want on $bg_acct, so nothing was started"
+    fi
+    session_dir=$(session_cwd "$use_acct" "$usable"); [ -z "$session_dir" ] || bg_dir=$session_dir
+    [ -d "$bg_dir" ] || bg_dir=''
+    bg_ledger=${XDG_STATE_HOME:-$HOME/.local/state}/claude-hub/bg-resume
+    mkdir -p -- "$bg_ledger/resumed" "$bg_ledger/pending" 2>/dev/null ||
+      bg_fail "the resume ledger's folder could not be made, so nothing was started"
+    find "$bg_ledger/resumed" -maxdepth 1 -type f -name '*.json' -mmin +43200 -delete 2>/dev/null
+    find "$bg_ledger/resumed" "$bg_ledger/pending" -maxdepth 1 -type f -name '.*.tmp' -mmin +1440 -delete 2>/dev/null
+    mv_dir=${XDG_STATE_HOME:-$HOME/.local/state}/claude-hub/claude-move
+    mkdir -p -- "$mv_dir" 2>/dev/null || bg_fail "the mover's lock folder could not be made, so nothing was started"
+    for mv_id in "${candidates[@]}"; do
+      [[ $mv_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || continue
+      if exec {mv_fd}>>"$mv_dir/$mv_id.lock"; then
+        bg_mv_fds+=("$mv_fd")
+      else
+        bg_fail "the mover's lock of that conversation could not be opened, so nothing was started"
+      fi
+      mv_rc=0; flock -n -E 75 "$mv_fd" || mv_rc=$?
+      [ "$mv_rc" -ne 75 ] || bg_fail "that conversation is being moved or started"
+      [ "$mv_rc" -eq 0 ] || bg_fail "the mover's lock of that conversation could not be taken, so nothing was started"
+    done
+    claims take "${candidates[@]}"; claim_rc=$?
+    [ "$claim_rc" -eq 3 ] || claimed_ids=("${candidates[@]}")
+    [ "$claim_rc" -ne 3 ] || bg_fail "that conversation is already being opened by another start"
+    [ "$claim_rc" -eq 0 ] || bg_fail "the conversation could not be claimed, so nothing was started"
+    ! peer_window "${candidates[@]}" || bg_fail "that conversation is already open in a window"
+    bg_state=$(bg_drop_mover_locks; bg_conv_state "$use_acct" "$usable" "$bg_ledger" "${candidates[@]}")
+    case $bg_state in
+      none\ ?*) bg_uuid=${bg_state#none } ;;
+      running*) bg_fail "that conversation is already running on $use_acct as ${bg_state#running }" ;;
+      'unknown transcript') bg_fail "the transcript of that conversation could not be read (no row of it names its first message), so a copy of it that runs cannot be told and it is not known whether it already runs; nothing was started" ;;
+      'unknown start') bg_fail "a start of that conversation on $use_acct has not been resolved (it may still be coming up, or have made a Claude that has not written its transcript yet), so it is not known whether that conversation already runs; nothing was started" ;;
+      *) bg_fail "the list of Claudes on $use_acct, or the transcript of one that runs, could not be read, so it is not known whether that conversation already runs; nothing was started" ;;
+    esac
+    bg_tmp=$(mktemp -d --tmpdir claude-bg-resume.XXXXXX 2>/dev/null) || bg_fail "no scratch folder could be made, so nothing was started"
+    if ! exec {bg_ow}>"$bg_tmp/out" {bg_or}<"$bg_tmp/out" {bg_ew}>"$bg_tmp/err" {bg_er}<"$bg_tmp/err"; then
+      rm -rf -- "$bg_tmp"; bg_tmp=''
+      bg_fail "no scratch file could be made, so nothing was started"
+    fi
+    bg_spool_fds=("$bg_ow" "$bg_or" "$bg_ew" "$bg_er")
+    rm -rf -- "$bg_tmp"; bg_tmp=''
+    bg_spawned=$use_acct
+    ( bg_keep_start "$use_acct" "$usable" "$bg_uuid" "$bg_dir" ) </dev/null >&"$bg_ow" 2>&"$bg_ew" &
+    wait $!; bg_rc=$?
+    bg_new='' bg_sid=''
+    { IFS= read -r bg_new; IFS= read -r bg_sid; } <&"$bg_or"
+    cat <&"$bg_er" >&2 2>/dev/null
+    bg_drop_spools; bg_spool_fds=()
+    case $bg_rc in 1|8|9) bg_spawned='' ;; esac      # refused, or never spawned: nothing started
+    bg_drop_mover_locks
+    [ "$bg_rc" -ne 8 ] || bg_fail "the start could not be marked in the resume ledger, so nothing was started"
+    if [ "$bg_rc" -eq 0 ] && [ -n "$bg_new" ]; then
+      [ -n "$bg_sid" ] || bg_partial "the Claude started as $bg_new on $use_acct but its session id could not be read" "$use_acct" "$bg_new"
+      python3 -c 'import json,sys; print(json.dumps({"ok": True, "account": sys.argv[1], "bg_id": sys.argv[2], "session_id": sys.argv[3]}))' \
+        "$use_acct" "$bg_new" "$bg_sid"
+      exit 0
+    fi
+    bg_finish "$bg_rc" "$use_acct" "$bg_new"
+    ;;
+  *)
+    sed -n '2,${/^#/!q;p}' \"$0\"; exit 2 ;;
+esac

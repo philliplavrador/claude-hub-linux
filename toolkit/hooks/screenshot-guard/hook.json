@@ -1,0 +1,7 @@
+{
+  "description": "Denies screenshots saved outside the project's allowed folders (a bare filename lands in the repo root)",
+  "event": "PreToolUse",
+  "matcher": "take_screenshot|browser_take_screenshot",
+  "timeout": 10,
+  "codex": false
+}

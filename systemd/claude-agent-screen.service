@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent screen guard: answers the KWin script about agent-owned windows
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=dbus
+BusName=org.claudehub.AgentScreen
+ExecStart=%h/.local/bin/claude-agent-screen watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

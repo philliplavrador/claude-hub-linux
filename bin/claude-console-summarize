@@ -1,0 +1,358 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execFileSync, spawnSync } = require('child_process');
+
+const STATE = path.join(os.homedir(), '.local', 'state', 'claude-console');
+const AUTH = path.join(STATE, 'auth');
+const WORK = path.join(STATE, 'work');
+const STRIP = require('path').join(require('os').homedir(), '.local/bin/claude-console-strip');
+let WRAPPER = '';
+try { WRAPPER = path.join(path.dirname(fs.realpathSync(__filename)), 'claude-timeout'); } catch {}
+const CLAUDE_SECONDS = Number(process.env.CLAUDE_CONSOLE_CLAUDE_TIMEOUT) > 0 ? Number(process.env.CLAUDE_CONSOLE_CLAUDE_TIMEOUT) : 60;
+const BACKSTOP_EXTRA = Number(process.env.CLAUDE_CONSOLE_BACKSTOP_EXTRA) > 0 ? Number(process.env.CLAUDE_CONSOLE_BACKSTOP_EXTRA) : 55;
+const WRAPPER_TIMED_OUT = 124;                          // its exit status for "stopped at the limit", as coreutils timeout
+
+function wrapperUsable() {
+  try { fs.accessSync(WRAPPER, fs.constants.X_OK); return fs.statSync(WRAPPER).isFile(); } catch { return false; }
+}
+const LIMIT = 120;
+
+const argv = process.argv.slice(2);
+const WHOLE = argv.includes('--whole');
+const PRINT = argv.includes('--print');
+const [account, sessionId, transcript] = argv.filter((a) => !a.startsWith('--'));
+if (!account || !sessionId) process.exit(0);
+
+
+const ACCOUNT_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+function secureDir(acct) {
+  if (!ACCOUNT_RE.test(acct || '')) return null;
+  const v = path.join(os.homedir(), '.claude-accounts', acct);
+  return path.isAbsolute(v) ? v : null;
+}
+
+function alertLog(tool, msg) {
+  try {
+    const file = process.env.CLAUDE_HUB_SIGNIN_ALERTS
+      || path.join(os.homedir(), '.local', 'state', 'claude-hub', 'signin-alerts.log');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const when = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    let line = `${when} ${tool}: ${String(msg).replace(/[\r\n]+/g, ' ')}`;
+    if (Buffer.byteLength(line) > 3990) line = Buffer.from(line).subarray(0, 3990).toString('utf8').replace(/\uFFFD$/, '');
+    const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT, 0o600);
+    try { fs.writeSync(fd, line + '\n'); } finally { fs.closeSync(fd); }
+  } catch { /* the log is a record, never a reason to stop */ }
+}
+
+function forkAlert(msg) {
+  process.stderr.write(`claude-console-summarize: ${msg}\n`);
+  alertLog('claude-console-summarize', msg);
+}
+
+function exists(p) { try { fs.lstatSync(p); return true; } catch { return false; } }
+
+const MARKER = '.fork-blocked';
+
+function retireCredentials(dir) {
+  const cred = path.join(dir, '.credentials.json');
+  if (!exists(cred)) return '';
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  let aside;
+  for (let n = 0; ; n++) {
+    aside = path.join(dir, `.credentials.json.forked-${stamp}${n ? `-${n}` : ''}`);
+    try { fs.closeSync(fs.openSync(aside, 'wx', 0o600)); break; }      // claim the name
+    catch (e) { if (e.code !== 'EEXIST') throw e; }
+  }
+  try { fs.renameSync(cred, aside); }                                  // replaces only our own empty claim
+  catch (e) {
+    try { fs.unlinkSync(aside); } catch {}
+    if (e.code === 'ENOENT') return '';
+    throw e;
+  }
+  if (fs.lstatSync(aside).isSymbolicLink()) { fs.unlinkSync(aside); return 'link'; }
+  fs.chmodSync(aside, 0o600);
+  forkAlert(`fork alert: ${cred} was a plain file, moved aside to ${path.basename(aside)}`);
+  return 'file';
+}
+
+function markFork(dir, why) {
+  try { fs.writeFileSync(path.join(dir, MARKER), `${new Date().toISOString()}\n${why}\n`, { mode: 0o600 }); } catch {}
+  forkAlert(`fork alert: ${dir} is blocked (${why}); after checking the real profile still works, remove ${path.join(dir, MARKER)}`);
+}
+
+function checkFork(dir) {
+  let found;
+  try { found = retireCredentials(dir); } catch { found = 'file'; }   // could not move it aside: fail closed too
+  if (found) markFork(dir, `it grew a credentials ${found} during a run`);
+  return Boolean(found);
+}
+
+function authDir(acct) {
+  if (!ACCOUNT_RE.test(acct || '')) return null;
+  const dir = path.join(AUTH, acct);
+  if (exists(path.join(dir, MARKER))) return null;         // forked before: refused until he removes the marker
+  const real = path.join(os.homedir(), '.claude-accounts', acct);
+  if (!fs.existsSync(path.join(real, '.credentials.json'))) return null;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    retireCredentials(dir);
+
+    const seed = path.join(dir, '.claude.json');
+    if (!fs.existsSync(seed)) {
+      let src = {};
+      try { src = JSON.parse(fs.readFileSync(path.join(real, '.claude.json'), 'utf8')); } catch {}
+      const out = {
+        hasCompletedOnboarding: true,
+        lastOnboardingVersion: src.lastOnboardingVersion || '2.1.267',
+        bypassPermissionsModeAccepted: true,
+      };
+      for (const k of ['oauthAccount', 'userID', 'organizationUuid']) {
+        if (src[k] !== undefined) out[k] = src[k];
+      }
+      fs.writeFileSync(seed, JSON.stringify(out, null, 2), { mode: 0o600 });
+    }
+
+    const settings = path.join(dir, 'settings.json');
+    if (!fs.existsSync(settings)) {
+      fs.writeFileSync(settings, JSON.stringify({ model: 'haiku', includeCoAuthoredBy: false }, null, 2));
+    }
+    return dir;
+  } catch { return null; }
+}
+
+
+function openingAsk(file) {
+  if (!file) return null;
+  let text = '';
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(Math.min(fs.fstatSync(fd).size, 512 * 1024));
+    fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    text = buf.toString('utf8');
+  } catch { return null; }
+
+  let user = '';
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('{')) continue;              // a partial first line, mid-record
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    const content = rec && rec.message && rec.message.content;
+    const pieces = Array.isArray(content)
+      ? content.filter((c) => c && c.type === 'text').map((c) => c.text)
+      : (typeof content === 'string' ? [content] : []);
+    const joined = pieces.join(' ').replace(/\s+/g, ' ').trim();
+    if (!joined) continue;
+    if (rec.type !== 'user') continue;
+    if (/^<[a-z-]+>/.test(joined)) continue;
+    if (joined.length < 15) continue;
+    if (/^continue from where you left off/i.test(joined)) continue;
+    user = joined;
+    break;                                            // the first real ask, and stop
+  }
+  return user ? { user } : null;
+}
+
+const NOT_HIM = /^(?:<|\[Image|\[Request interrupted|\[Cross-session|Stop hook feedback|Base directory for this skill|Your response above was stopped|This session is being continued|Continue from where you left off)/i;
+
+function allAsks(file) {
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return []; }
+  const asks = [];
+  for (const line of text.split('\n')) {
+    if (!/"type":\s*"user"/.test(line)) continue;     // skip parsing everything else
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!rec || rec.type !== 'user' || rec.isMeta) continue;
+    const content = rec.message && rec.message.content;
+    const pieces = Array.isArray(content)
+      ? content.filter((c) => c && c.type === 'text').map((c) => c.text)
+      : (typeof content === 'string' ? [content] : []);
+    const joined = pieces.join(' ').replace(/\s+/g, ' ').trim();
+    if (joined.length < 8 || NOT_HIM.test(joined)) continue;
+    asks.push(joined);
+  }
+  return asks.length <= 8 ? asks : [...asks.slice(0, 3), ...asks.slice(-5)];
+}
+
+
+const KNOWN = new Map([
+  ...['ClaudeHub', 'Konsole', 'Claude', 'Codex', 'KDE', 'KWin', 'Firefox', 'GitHub', 'Ollama'].map((n) => [n.toLowerCase(), n]),
+]);
+
+function tidy(title, source) {
+  const WORD = /[A-Za-z][A-Za-z0-9'+-]*/g;
+  const exact = new Map(KNOWN);                    // lower -> an acronym / camel / known spelling
+  const proper = new Map();                        // lower -> capitalised mid-sentence
+  for (const m of source.matchAll(WORD)) {
+    const w = m[0];
+    const lower = w.toLowerCase();
+    if ((w.length > 1 && w === w.toUpperCase() && /[A-Z]/.test(w)) || /[a-z][A-Z]/.test(w)) {
+      if (!exact.has(lower)) exact.set(lower, w);
+    } else if (/^[A-Z]/.test(w) && /[a-z0-9,;:] $/.test(source.slice(Math.max(0, m.index - 2), m.index))) {
+      if (!proper.has(lower)) proper.set(lower, w);
+    }
+  }
+  const seen = new Set(Array.from(source.matchAll(WORD), (m) => m[0].toLowerCase()));
+  let first = true;
+  return title.replace(WORD, (w) => {
+    const lower = w.toLowerCase();
+    let out;
+    if (exact.has(lower)) out = exact.get(lower);
+    else if (proper.has(lower)) out = proper.get(lower);
+    else if (!seen.has(lower) && w.length >= 5 && nearMiss(lower, proper)) out = nearMiss(lower, proper);
+    else if (w.length > 1 && w === w.toUpperCase()) out = w;           // AI, PDF
+    else out = lower;
+    if (first && /^[a-z]/.test(out)) out = out.charAt(0).toUpperCase() + out.slice(1);
+    first = false;
+    return out;
+  });
+}
+
+function nearMiss(lower, proper) {
+  for (const [k, v] of proper) {
+    if (k.length >= 5 && Math.abs(k.length - lower.length) <= 1 && editDistance(k, lower) === 1) return v;
+  }
+  return null;
+}
+
+function editDistance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cur = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+  }
+  return row[b.length];
+}
+
+
+function ask(dir, prompt) {
+  try { fs.mkdirSync(WORK, { recursive: true }); } catch {}
+  const storage = secureDir(account);
+  if (!storage) return '';
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, CLAUDE_SECURESTORAGE_CONFIG_DIR: storage };
+  delete env.KONSOLE_DBUS_SERVICE;
+  delete env.KONSOLE_DBUS_SESSION;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+
+  const claudeArgs = ['-p', '--model', 'haiku', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}'];
+  const wrapped = wrapperUsable();
+  const res = wrapped
+    ? spawnSync(WRAPPER, [String(CLAUDE_SECONDS), '--', 'claude', ...claudeArgs],
+      { input: prompt, encoding: 'utf8', cwd: WORK, env, timeout: (CLAUDE_SECONDS + BACKSTOP_EXTRA) * 1000 })
+    : spawnSync('claude', claudeArgs, { input: prompt, encoding: 'utf8', cwd: WORK, env, timeout: 60000 });
+  checkFork(dir);
+  if (res.status === WRAPPER_TIMED_OUT && wrapped) return '';      // the wrapper stopped claude at its limit: no title
+  if (res.status !== 0 || !res.stdout) return '';
+  return res.stdout;
+}
+
+const OLLAMA = 'http://127.0.0.1:11434/api/generate';
+const EXAMPLES = ['Invoice PDF export', 'GitHub OAuth sign-in', 'Flaky checkout test', 'NASA API rate limits'];
+const LOCAL_MODEL = process.env.CLAUDE_CONSOLE_MODEL || 'gemma3:4b';
+
+function askLocal(prompt) {
+  const body = JSON.stringify({
+    model: LOCAL_MODEL,
+    prompt,
+    stream: false,
+    think: false,                       // qwen-style models otherwise answer with their reasoning
+    options: { temperature: 0.2, num_predict: 48 },
+  });
+  const res = spawnSync('curl', ['-s', '--max-time', '25', '-H', 'Content-Type: application/json',
+    '--data-binary', '@-', OLLAMA], { input: body, encoding: 'utf8', timeout: 30000 });
+  if (res.status !== 0 || !res.stdout) return '';
+  try {
+    return String(JSON.parse(res.stdout).response || '')
+      .replace(/<think>[\s\S]*?<\/think>/g, '');
+  } catch { return ''; }
+}
+
+function clean(raw) {
+  let s = String(raw || '').replace(/\s+/g, ' ').trim();
+  s = s.replace(/^["'`]+|["'`]+$/g, '').trim();
+  s = s.replace(/^(?:title|summary)\s*:\s*/i, '');
+  s = s.replace(/\s*[.]+$/, '');
+  if (!s || s.length < 3) return '';
+  if (/\b(I cannot|I can't|as an AI|sorry)\b/i.test(s)) return '';
+  if (s.length > LIMIT) s = s.slice(0, LIMIT).trim();
+  return s;
+}
+
+function main() {
+  if (process.env.CLAUDE_CONSOLE_SUMMARY === 'off') return;
+
+  const lock = path.join(STATE, `${sessionId.replace(/[^a-zA-Z0-9-]/g, '')}${WHOLE ? '.whole' : ''}.lock`);
+  try {
+    fs.mkdirSync(STATE, { recursive: true });
+    try { if (Date.now() - fs.statSync(lock).mtimeMs > 90000) fs.unlinkSync(lock); } catch {}
+    fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
+  } catch { return; }
+
+  try {
+    const dir = process.env.CLAUDE_CONSOLE_SUMMARY === 'haiku' ? authDir(account) : 'local';
+    if (!dir) return;
+
+    let prompt, source;
+    if (WHOLE) {
+      const asks = allAsks(transcript);
+      if (!asks.length) return;
+      source = asks.join('\n').slice(0, 2400);
+      prompt = [
+        'Below is what a developer asked during one coding session, in order.',
+        'Write a short title naming what the session is for: two to five words.',
+        '',
+        'Rules: output the title and nothing else. Sentence case, but copy product names and acronyms',
+        'exactly as the developer spelled them. No quotes, no trailing period, no preamble. Name the thing',
+        'being built, fixed or found out, not the person asking and not how it is being done. If the',
+        'session moved on to something else, name what it is for now.',
+        '',
+        'Examples of good titles:',
+        ...EXAMPLES.map((e) => `- ${e}`),
+        '',
+        'WHAT THEY ASKED:',
+        asks.map((a) => `- ${a.slice(0, 400)}`).join('\n').slice(0, 2400),
+      ].join('\n');
+    } else {
+      const ex = openingAsk(transcript);
+      if (!ex) return;
+      source = ex.user;
+      prompt = [
+        'Below is the first thing a developer asked at the start of a coding session.',
+        'Name what that session is for, in two to five words, as a title.',
+        '',
+        'Rules: output the title and nothing else. Sentence case. No quotes, no trailing period,',
+        'no preamble, no explanation. Name the thing being built or fixed, not the person asking',
+        'and not how it is being done.',
+        '',
+        `THEM: ${ex.user.slice(0, 1200)}`,
+      ].join('\n');
+    }
+
+    const mode = process.env.CLAUDE_CONSOLE_SUMMARY || 'local';
+    let summary = clean(mode === 'haiku' ? ask(dir, prompt) : askLocal(prompt));
+    if (!summary || EXAMPLES.some((e) => e.toLowerCase() === summary.toLowerCase())) return;
+    summary = tidy(summary, source);
+
+    if (PRINT) {
+      process.stdout.write(summary + '\n');
+      return;
+    }
+
+    execFileSync(STRIP, ['summary', sessionId, summary], { stdio: 'ignore', timeout: 10000 });
+  } finally {
+    try { fs.unlinkSync(lock); } catch {}
+  }
+}
+
+try { main(); } catch (e) { if (process.env.CLAUDE_CONSOLE_DEBUG) console.error(e); }
+process.exit(0);

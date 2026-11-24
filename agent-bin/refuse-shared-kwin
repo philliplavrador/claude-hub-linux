@@ -1,0 +1,53 @@
+#!/bin/sh
+
+name=$(basename "$0")
+
+harmless=1
+[ "$#" -gt 0 ] || harmless=0
+for a in "$@"; do
+  case "$a" in
+    --help|-h|--version|-v) ;;
+    *) harmless=0 ;;
+  esac
+done
+
+if [ "$harmless" -eq 0 ] && grep -q 'plasma-kwin_wayland\.service' /proc/self/cgroup 2>/dev/null; then
+  harmless=1
+fi
+
+if [ "$harmless" -eq 0 ]; then
+  uid=$(id -u)
+  real_home=$(getent passwd "$(id -un)" | cut -d: -f6)
+  [ -n "$real_home" ] || real_home=$HOME          # no passwd entry: HOME is the best there is
+  real_home=${real_home%/}
+  cfg=${XDG_CONFIG_HOME:-$HOME/.config}
+  cfg=${cfg%/}
+  bus=${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$uid}/bus}
+
+  why=""
+  if [ -n "$real_home" ] && [ "$cfg" = "$real_home/.config" ]; then
+    why="its settings folder is his real one ($cfg)"
+  else
+    case "$bus" in
+      *"/run/user/$uid/bus"*) why="its D-Bus session is his real one ($bus)" ;;
+    esac
+  fi
+
+  if [ -n "$why" ]; then
+    printf "claude-hub: refusing '%s %s': %s.\n" "$name" "$*" "$why" >&2
+    echo "claude-hub: a second KWin on the user's bus with the user's settings takes the global shortcuts," >&2
+    echo "claude-hub: and they stay dead after it closes." >&2
+    echo "claude-hub: run it with private HOME/XDG_* dirs set in FRONT of" >&2
+    echo "claude-hub: 'dbus-run-session -- kwin_wayland ...'." >&2
+    log="${XDG_STATE_HOME:-$HOME/.local/state}/claude-hub/agent-screen.log"
+    mkdir -p "$(dirname "$log")" 2>/dev/null
+    printf '%s refused: %s %s (%s)\n' "$(date '+%F %T')" "$name" "$*" "$why" >> "$log" 2>/dev/null
+    exit 1
+  fi
+fi
+
+for d in /usr/bin /bin /usr/local/bin; do
+  [ -x "$d/$name" ] && exec "$d/$name" "$@"
+done
+printf 'claude-hub: %s not found outside the agent shims\n' "$name" >&2
+exit 127

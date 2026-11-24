@@ -1,0 +1,1866 @@
+#!/usr/bin/env python3
+"""claude-move: move one running Claude to another subscription, same conversation.
+
+  claude-move <session id> <account> [--model M] [--continue | --signed-out | --asking | --wake] [--force]
+                       [--json]
+
+What claude-account does, without its menu, and the auto-swap watcher's hands. Copies the transcript into the other account,
+stops the Claude, starts it there with --resume: a background Claude in a window through its wrapper (the record's
+`switch`), one without a window with `claude --bg --resume`, a plain Claude by Ctrl+C twice, /exit and a relaunch in
+its own tab. The same account with --model only changes the model. The model it ran is kept unless --model says
+otherwise; either way a conversation over 150 000 tokens keeps the 1M context.
+
+  --continue    sends "continue" once it runs again (a reply a limit cut off). To the account the Claude is already on
+                it is the swapper's wake after that account's limit reset: the same stop and `--bg --resume`, restarted
+                where it is, with no transcript copy and no account change. Refused ("no longer stopped at its limit")
+                unless the Claude is still stopped at that limit.
+  --signed-out  --continue for a Claude whose account was signed out: the same move, the same refusals.
+  --asking      moves a Claude that is waiting on a question, because its account is spent: only while the question is
+                as it was asked (nothing typed into it); once it runs again it is told it was moved and asks the same
+                question again. A permission prompt is never moved.
+  --wake        tells the Claude, once it runs again, that and why it was moved, in a message that starts with
+                a bracketed tag; what it was in the middle of picks the wording (working, question, limit, signed-out,
+                warned, background or none).
+
+A blank session id is refused at once (exit 2, "no session id"). Refuses (exit 3, nothing touched): not running; the
+account it is already on (unless --model, or --continue); busy or waiting on you (unless --force, or --asking for
+waiting); text in its prompt that was not sent (unless --force); already being moved by another call on the same
+session (a per-session lock); a move to an account whose first run was never finished, or that was never told to trust
+the folder the Claude would start in (--force bypasses neither). If it will not start on the other account it is
+started again where it was (exit 1).
+
+A Claude already stopped is never simply left gone: a failure after the stop is a best-effort restart where it was, and
+the report says plainly whether that restart worked. For a Claude in a window the window's wrapper makes the restart
+(the switch is turned around to name the old account); for one without a window the mover does, but only when it
+knows nobody else will and that the Claude runs nowhere; a list it cannot read is never "nothing runs".
+
+Before anything stops the Claude a marker (state/claude-hub/claude-move/<session id>: epoch seconds and the target
+account) says a move is ending it. What belongs to the conversation goes to the other account with it, before the stop
+and again after it: the conversation's own folder (with subagents/ and tool-results/), its task list and its file
+history (a hard link where the filesystem allows, never a symlink, a lock file or a half-written file; the newest file
+wins). If it comes up under a new session id those are copied to the new id. A failure in any of it is a note in the
+result's reason and never stops the move.
+
+A row counts as the moved Claude only when it is that Claude for sure, never merely because it is new. A Claude not
+seen like that in time is a failed move: nothing is reported or written under a session id that was not seen. A failed
+move names the Claude where it runs now whenever the mover knows which one that is.
+
+Every write of a window's record holds one lock (the file .records.lock in the records folder, tried every 0.05 s for
+at most CLAUDE_HUB_RECORD_LOCK_WAIT seconds, 5 by default), so a clear and the wrapper's read cannot interleave and
+start two copies of one conversation.
+
+A background Claude the daemon has just resumed is a fork under a new session id whose transcript file does not exist
+until its first new message; its daemon roster entry names the conversation it was forked from, so with no transcript
+of its own it moves with that one, copied under the Claude's own id.
+
+Exit: 0 moved, 1 failed (it runs where it was), 2 usage, 3 refused.
+Test switches: CLAUDE_HUB_MOVE_TIMEOUT, CLAUDE_HUB_MOVE_WAIT_TIMEOUT, CLAUDE_HUB_MOVE_STOP_TIMEOUT,
+CLAUDE_HUB_MOVE_WINDOWED_WAIT, CLAUDE_HUB_MOVE_ATTACH_OF, CLAUDE_HUB_MOVE_SLICE_WAIT, CLAUDE_HUB_MOVE_LOOK_WAIT,
+CLAUDE_HUB_MOVE_WENT_LOOK_WAIT, CLAUDE_HUB_MOVE_TAIL_RESERVE, CLAUDE_HUB_MOVE_START_MIN, CLAUDE_HUB_MOVE_ASK_TIMEOUT,
+CLAUDE_HUB_MOVE_ASKED_WAIT, CLAUDE_HUB_MOVE_JOB_WAIT, CLAUDE_HUB_MOVE_BUDGET, CLAUDE_HUB_MOVE_CLOSE_WAIT,
+CLAUDE_HUB_RECORD_LOCK_WAIT, plus claude-desks's.
+"""
+from __future__ import annotations
+
+import argparse
+import codecs
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+
+def _load_desktop():
+    path = Path(__file__).resolve().parent / "claude-desks"
+    if not path.exists() and shutil.which("claude-desks"):
+        path = Path(shutil.which("claude-desks")).resolve()
+    loader = importlib.machinery.SourceFileLoader("claude_desks", str(path))
+    spec = importlib.util.spec_from_loader("claude_desks", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _load_swapper():
+    try:
+        path = Path(__file__).resolve().parent / "claude-autoswap"
+        if not path.exists() and shutil.which("claude-autoswap"):
+            path = Path(shutil.which("claude-autoswap")).resolve()
+        loader = importlib.machinery.SourceFileLoader("claude_autoswap", str(path))
+        spec = importlib.util.spec_from_loader("claude_autoswap", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except (Exception, SystemExit):
+        return None
+
+
+DK = _load_desktop()
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+START_LINE = re.compile(r"[ \t]*backgrounded[ \t]+\xb7[ \t]+([0-9a-f]{8})(?![A-Za-z0-9])")
+LOOSE_START = re.compile(r"backgrounded \xb7 ([0-9a-f]{8})")
+PROMPT, RULE = "❯", "─"
+BIG_CONTEXT = 150_000
+START_TIMEOUT = float(os.environ.get("CLAUDE_HUB_MOVE_TIMEOUT") or 60)
+WAIT_TIMEOUT = float(os.environ.get("CLAUDE_HUB_MOVE_WAIT_TIMEOUT") or 20)
+STOP_TIMEOUT = float(os.environ.get("CLAUDE_HUB_MOVE_STOP_TIMEOUT") or 30)
+BG_TIMEOUT = float(os.environ.get("CLAUDE_HUB_BG_TIMEOUT") or 60)
+BG_LOCK_WAIT = float(os.environ.get("CLAUDE_HUB_BG_LOCK_WAIT") or 120)
+BG_NAMED_WAIT = float(os.environ.get("CLAUDE_HUB_BG_NAMED_WAIT") or 15)
+WINDOWED_WAIT = float(os.environ.get("CLAUDE_HUB_MOVE_WINDOWED_WAIT") or (BG_TIMEOUT + 15))
+SLICE_WAIT = float(os.environ.get("CLAUDE_HUB_MOVE_SLICE_WAIT") or 1)
+LOOK_WAIT = float(os.environ.get("CLAUDE_HUB_MOVE_LOOK_WAIT") or 2)
+WENT_LOOK_WAIT = float(os.environ.get("CLAUDE_HUB_MOVE_WENT_LOOK_WAIT") or 10)
+TAIL_RESERVE = float(os.environ.get("CLAUDE_HUB_MOVE_TAIL_RESERVE") or 20)
+START_MIN = float(os.environ.get("CLAUDE_HUB_MOVE_START_MIN") or 5)
+ASK_TIMEOUT = float(os.environ.get("CLAUDE_HUB_MOVE_ASK_TIMEOUT") or 30)
+ASKED_WAIT = float(os.environ.get("CLAUDE_HUB_MOVE_ASKED_WAIT") or 30)
+JOB_WAIT = float(os.environ.get("CLAUDE_HUB_MOVE_JOB_WAIT") or 5)
+MOVE_BUDGET = float(os.environ.get("CLAUDE_HUB_MOVE_BUDGET") or 170)
+PROBE_ROOM = 25
+CLOSE_WAIT = float(os.environ.get("CLAUDE_HUB_MOVE_CLOSE_WAIT") or 8)
+RECORD_LOCK_WAIT = float(os.environ.get("CLAUDE_HUB_RECORD_LOCK_WAIT") or 5)
+LOCK_DIR = DK.STATE_HOME / "claude-move"
+MARKER_KEEP = 24 * 3600
+SOFT_NOTES: list[str] = []
+CONTINUE = "continue"
+REASK = ("[Auto-swapper, {at}] {src} ran out of usage while your question to the user was open, so this "
+         "conversation moved to {to}. He has not answered it. If the question was only about the usage limit or "
+         "which account to use, drop it and carry on with the work; otherwise ask it again, as it was.")
+TAG = "[Account switch, {at}] the user moved this conversation from {src} to {to}"
+KEEPER = (" Background commands were stopped. Before you start any of them again, check what the stopped work "
+          "left behind, then restart only what still needs to run.")
+DONE_OR_ASK = (" If your work was finished, restart only what still needs to run and end your turn. If you were "
+               "waiting for the user's answer, ask the question again.")
+WORKING = (TAG + " while you were working. The move stopped your turn." + KEEPER
+           + " Then carry on from where you stopped." + DONE_OR_ASK)
+REASK_SWITCH = (TAG + " while you were waiting for the user's answer to a question or a permission prompt. He has not "
+                "answered: the move closed it, and if it reads as declined or refused, that was the move, not him. "
+                "If you were asking only about the usage limit or which account to use, drop that and carry on with "
+                "the work; otherwise ask again, or retry the refused step.")
+LIMIT_SWITCH = TAG + " because {src} ran out of usage. Carry on from where you stopped."
+WARNED_SWITCH = (TAG + " after {src} warned that its usage was nearly gone. If you stopped early because of that "
+                 "warning, carry on from where you stopped; if your work was finished, end your turn as you "
+                 "normally would.")
+BACKGROUND_SWITCH = TAG + "." + KEEPER + " Then carry on." + DONE_OR_ASK
+BG_NOTE = KEEPER
+LIMIT_BG = ("[Auto-swapper, {at}] {src} ran out of usage, so this conversation moved to {to}." + KEEPER
+            + " Then carry on from where you stopped.")
+SIGNED_OUT_BG = ("[Auto-swapper, {at}] {src} was signed out, so this conversation moved to {to}." + KEEPER
+                 + " Then carry on from where you stopped.")
+LIMIT_IN_PLACE = ("[Auto-swapper, {at}] The usage limit on {src} has reset, so this conversation was restarted on it."
+                  + KEEPER + " Then carry on from where you stopped.")
+FAILED_HEAD = ("[Account switch, {at}] the user tried to move this conversation from {src} to {to}, but the move "
+               "failed and it stayed on {src}")
+FAILED_BACK = (FAILED_HEAD + "; the attempt stopped your turn." + KEEPER
+               + " Then carry on from where you stopped." + DONE_OR_ASK)
+FAILED_IDLE = FAILED_HEAD + "." + KEEPER + " Then carry on." + DONE_OR_ASK
+FAILED_ASK = (FAILED_HEAD + ". You were waiting for the user's answer to a question or a permission prompt, and he has not "
+              "answered: the attempt closed it, and if it reads as declined or refused, that was the attempt, not him. "
+              "Ask again, or retry the refused step.")
+FAILED_REASK = ("[Auto-swapper, {at}] {src} ran out of usage while your question to the user was open. A move to {to} "
+                "failed and this conversation stayed on {src}; the attempt closed your question, and if it reads as "
+                "declined, that was the attempt, not him. Ask it again, as it was.")
+JOB_NOTE = (" Your job folder is now the one on {to} ($CLAUDE_JOB_DIR); the files you kept in the old one are "
+            "copied there, possibly a moment after this message.")
+QUESTION_FOOTER = ("Enter to select", "Esc to cancel")
+FREE_TEXT = re.compile(r"^\s*(?:❯\s*)?\d+\.\s+(?:\[ \]\s+)?Type something\.?(?:\s|$)")
+NEXT_ROW = re.compile(r"^\s*(?:❯\s*)?Next\s*$")
+TICKED = re.compile(r"\[[^\]\s]\]")
+CHAT_ROW = re.compile(r"^\s*(?:❯\s*)?\d+\.\s+Chat about this\s*$")
+
+
+class Failed(Exception):
+
+    def __init__(self, message: str = "", row: dict | None = None):
+        super().__init__(message)
+        self.row = row
+
+
+class WentBack(Failed):
+    ...
+
+
+class Said(str):
+
+    def __new__(cls, words: str, row: dict | None = None, account: str | None = None):
+        out = super().__new__(cls, words)
+        out.row = row
+        out.account = account
+        return out
+
+
+
+def acquire_lock(session_id: str):
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_DIR / f"{session_id}.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+REASON_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
+REASON_MOST = 512
+
+
+def _proc_start(pid: int) -> str | None:
+    try:
+        with open("/proc/%d/stat" % pid) as fh:
+            line = fh.read()
+        return line[line.rindex(")") + 2:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _reason_text(path: Path) -> str:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        data = os.read(fd, REASON_MOST)
+        return codecs.getincrementaldecoder("utf-8")().decode(data, final=len(data) < REASON_MOST)
+    except (OSError, UnicodeDecodeError):
+        return ""
+    finally:
+        os.close(fd)
+
+
+def lock_reason(session_id: str) -> str:
+    if not REASON_ID.fullmatch(session_id or ""):
+        return ""
+    why, _, rest = _reason_text(LOCK_DIR / f"{session_id}.reason").partition("\n")
+    holder = re.fullmatch(r"pid (\d{1,7})(?:\nstart\b(.*))?", rest.strip(), re.S)
+    if holder:
+        pid = int(holder.group(1))
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return ""
+        except PermissionError:
+            pass
+        if holder.group(2) is not None and _proc_start(pid) != holder.group(2).strip():
+            return ""
+    return "".join(c for c in why if c.isprintable()).strip()[:80]
+
+
+
+def transcript(account: str, sid: str) -> Path | None:
+    best = None
+    for path in sorted((DK.ACCTS / account / "projects").glob(f"*/{sid}.jsonl")):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        if best is None or (st.st_mtime, st.st_size) > best[0]:
+            best = ((st.st_mtime, st.st_size), path)
+    return best[1] if best else None
+
+
+def resumed_from(account: str, s: dict) -> Path | None:
+    own = s.get("session_id") or ""
+    if s.get("kind") != "background" or not REASON_ID.fullmatch(own):
+        return None
+    try:
+        workers = json.loads((DK.ACCTS / account / "daemon" / "roster.json").read_text())["workers"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(workers, dict):
+        return None
+    worker = next((w for w in workers.values() if isinstance(w, dict) and w.get("sessionId") == own), None)
+    if worker is None:
+        under_short_id = workers.get(s.get("id") or "")
+        if isinstance(under_short_id, dict) and not under_short_id.get("sessionId"):
+            worker = under_short_id
+    dispatch = worker.get("dispatch") if worker else None
+    launch = dispatch.get("launch") if isinstance(dispatch, dict) else None
+    if not isinstance(launch, dict) or launch.get("mode") != "resume":
+        return None
+    old = launch.get("sessionId")
+    if not isinstance(old, str) or old == own or not REASON_ID.fullmatch(old):
+        return None
+    return transcript(account, old)
+
+
+def current_transcript(s: dict, tpath: Path) -> Path:
+    own = s["session_id"]
+    if tpath.stem == own or s.get("own_made"):
+        return tpath
+    return transcript(s["account"], own) or tpath
+
+
+def resume_id(s: dict, tpath: Path) -> str:
+    own = s["session_id"]
+    if tpath.stem == own or transcript(s["account"], own):
+        return own
+    return tpath.stem
+
+
+def tail(path: Path, size: int = 1 << 20) -> list[dict]:
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - size))
+        raw = f.read().decode("utf-8", "replace").splitlines()
+    out = []
+    for line in raw[1:] if len(raw) > 1 and path.stat().st_size > size else raw:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def slug(p: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "-", p)
+
+
+def rename_map():
+    return None
+
+
+def resume_dir(c: str, key: str) -> str:
+    work = rename_map()
+    for cand in [c] + ([work.map_path(c, d) for d in ("forward", "undo")] if work else []):
+        if cand and slug(cand) == key and Path(cand).is_dir():
+            return cand
+    return ""
+
+
+def facts(path: Path) -> dict:
+    rows = tail(path)
+    model, tokens, mode, cwd, effort, chosen = "", 0, "", "", "", ""
+    for r in reversed(rows):
+        if not effort and r.get("type") == "assistant" and r.get("effort"):
+            effort = r["effort"]
+        m = r.get("message") or {}
+        if not model and not chosen:
+            chosen = chosen_model(r)
+        if not model and r.get("type") == "assistant" and m.get("model") and m["model"] != "<synthetic>":
+            model = m["model"] if not chosen or chosen in m["model"] else chosen
+            u = m.get("usage") or {}
+            tokens = sum(int(u.get(k) or 0) for k in
+                         ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        if not mode and r.get("type") == "permission-mode":
+            mode = r.get("permissionMode") or ""
+        c = r.get("cwd")
+        if not cwd and isinstance(c, str) and os.path.isabs(c):
+            cwd = resume_dir(c, path.parent.name)
+    model = model or chosen
+    return {"model": "" if model == "other" else model, "tokens": tokens, "mode": mode, "cwd": cwd, "effort": effort}
+
+
+_SET_MODEL = re.compile(r"\s*<local-command-stdout>\s*Set model to\s+`?(?:claude-)?(?:(fable|opus|sonnet|haiku)\b)?",
+                        re.IGNORECASE)
+
+
+def chosen_model(r) -> str:
+    if not isinstance(r, dict) or not isinstance(r.get("message"), dict):
+        return ""
+    content = r["message"].get("content")
+    if r.get("type") == "user" and isinstance(content, str):
+        m = _SET_MODEL.match(content)
+        return (m.group(1) or "other").lower() if m else ""
+    if r.get("type") == "assistant" and r["message"].get("model") == "<synthetic>" and isinstance(content, list):
+        text = " ".join(p.get("text") or "" for p in content if isinstance(p, dict))
+        return "fable" if "hit your Fable limit" in text else ""
+    return ""
+
+
+def start_folder(s: dict, rec: dict | None, f: dict) -> str:
+    if f.get("cwd"):
+        return f["cwd"]
+    try:
+        if s["kind"] == "plain":
+            shell = DK.parent_of(s["pid"]) if s.get("pid") else 0
+            return os.readlink(f"/proc/{shell}/cwd") if shell > 1 else ""
+        if rec:
+            pid = _wrapper_pid(rec)
+            if pid and wrapper_is_script(rec):
+                return os.readlink(f"/proc/{pid}/cwd")
+            kept = rec.get("cwd")
+            return kept if isinstance(kept, str) and os.path.isabs(kept) else ""
+        return os.getcwd()
+    except (OSError, ValueError):
+        return ""
+
+
+def first_prompt(path: Path, limit: int = 2000) -> str:
+    with path.open("rb") as fh:
+        for _, raw in zip(range(limit), fh):
+            try:
+                r = json.loads(raw)
+            except ValueError:
+                continue
+            c = (r.get("message") or {}).get("content") if r.get("type") == "user" else None
+            if isinstance(c, list):
+                c = next((p.get("text") for p in c if isinstance(p, dict) and p.get("type") == "text"), None)
+            if isinstance(c, str):
+                return c
+    return ""
+
+
+def model_flag(requested: str | None, f: dict) -> str | None:
+    m = requested or f["model"]
+    if not m:
+        return None
+    if "[" not in m and f["tokens"] > BIG_CONTEXT:
+        m += "[1m]"
+    return m
+
+
+
+def is_prompt(r) -> bool:
+    if not isinstance(r, dict) or r.get("type") != "user" or r.get("isMeta") or "toolUseResult" in r:
+        return False
+    c = (r.get("message") or {}).get("content") if isinstance(r.get("message"), dict) else None
+    return isinstance(c, str) and not c.startswith("<")
+
+
+def wake_facts(s: dict, tpath: Path) -> dict:
+    out = {"pending": 1 if s.get("status") == "shell" else 0, "hit": False, "warned": False}
+    sw = _load_swapper()
+    if sw is None:
+        return out
+    sid, account, now = s["session_id"], s["account"], time.time()
+    five = getattr(sw, "FIVE_HOURS", 5 * 3600)
+    since = now - five
+    try:
+        since = sw.work_since(s.get("started"), now)
+        out["pending"] += int(sw.background_work(account, sid, since))
+    except (Exception, SystemExit):
+        pass
+    try:
+        t = sw.transcript_facts(account, sid)
+        out["hit"] = bool((sw.HITS / f"{sid}.json").exists() or t["hit"])
+        warned_at = t["warned_at"]
+        if warned_at is not None and warned_at >= max(since, now - five):
+            said = [sw._epoch(r.get("timestamp")) for r in tail(tpath) if is_prompt(r)]
+            out["warned"] = warned_at > max((x for x in said if x is not None), default=0)
+    except (Exception, SystemExit):
+        pass
+    return out
+
+
+def stop_facts(s: dict) -> dict:
+    out = {"hit": False, "signed_out": False, "input_after": False}
+    sw = _load_swapper()
+    if sw is None:
+        return out
+    try:
+        t = sw.transcript_facts(s["account"], s["session_id"])
+        out["hit"] = bool((sw.HITS / f"{s['session_id']}.json").exists() or t["hit"])
+        out["signed_out"] = bool(t["signed_out"])
+        out["input_after"] = bool(sw.turn_started(t.get("input_at"), time.time()))
+    except (Exception, SystemExit):
+        return {"hit": False, "signed_out": False, "input_after": False}
+    return out
+
+
+def wake_plan(mode: str, s: dict, to: str, wf: dict) -> tuple[str, str | None, str | None]:
+    if mode == "wake" and s["account"] == to:
+        return "", None, None
+    pending = wf["pending"] > 0
+    if mode == "asking":
+        kind, text = "question", REASK + (BG_NOTE if pending else "")
+        restart = FAILED_REASK + (BG_NOTE if pending else "")
+    elif mode == "continue":
+        told = LIMIT_IN_PLACE if s["account"] == to else LIMIT_BG
+        kind, text, restart = "limit", told if pending else CONTINUE, (CONTINUE if s["account"] == to else None)
+    elif mode == "signed-out":
+        kind, text, restart = "signed-out", SIGNED_OUT_BG if pending else CONTINUE, None
+    elif mode == "wake":
+        restart = None
+        if s.get("status") == "busy":
+            kind, text, restart = "working", WORKING, FAILED_BACK
+        elif s.get("status") == "waiting":
+            kind, text, restart = "question", REASK_SWITCH, FAILED_ASK
+        elif wf["hit"]:
+            kind, text = "limit", LIMIT_SWITCH
+        elif wf["warned"]:
+            kind, text = "warned", WARNED_SWITCH
+        elif pending:
+            kind, text, restart = "background", BACKGROUND_SWITCH, FAILED_IDLE
+        else:
+            return "", None, None
+        if pending and kind in ("question", "limit", "warned"):
+            text += BG_NOTE
+            restart = restart + BG_NOTE if restart else FAILED_IDLE
+        if s["kind"] != "plain" and s.get("id") and (DK.ACCTS / s["account"] / "jobs" / s["id"]).is_dir():
+            text += JOB_NOTE
+    else:
+        return "", None, None
+    fill = {"at": time.strftime("%H:%M"), "src": s["account"], "to": to}
+    return kind, text.format(**fill), restart.format(**fill) if restart else None
+
+
+
+def qdbus(*args: str) -> str:
+    try:
+        return subprocess.run(["qdbus6", *args], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def prompt_block(svc: str, obj: str) -> list[str] | None:
+    lines = qdbus(svc, obj, "org.kde.konsole.Session.getAllDisplayedTextList", "true").splitlines()
+    idx = max((i for i, l in enumerate(lines) if l.lstrip().startswith(PROMPT)), default=-1)
+    if idx < 0:
+        return None
+    block = []
+    for l in lines[idx:]:
+        if l.lstrip().startswith(RULE):
+            break
+        block.append(l.rstrip().replace("\xa0", " "))
+    return block
+
+
+def has_unsent_text(svc: str, obj: str) -> bool:
+    if prompt_block(svc, obj) is None:
+        return True
+    qdbus(svc, obj, "org.kde.konsole.Session.sendText", "/")
+    time.sleep(0.8)
+    after = prompt_block(svc, obj) or []
+    qdbus(svc, obj, "org.kde.konsole.Session.sendText", "\x7f")
+    return [l.strip() for l in after] != [PROMPT + " /"]
+
+
+def _blank(line: str) -> bool:
+    return not line.strip() or line.lstrip().startswith(RULE)
+
+
+def footer_at(lines: list[str]) -> int:
+    start, end = QUESTION_FOOTER
+    joined = lambda i: " ".join(l.strip() for l in lines[i:i + 2])
+    return max((i for i, l in enumerate(lines) if start in l and end in joined(i)), default=-1)
+
+
+def question_untouched(lines: list[str]) -> bool:
+    lines = [ANSI.sub("", l).replace("\xa0", " ").rstrip() for l in lines]
+    foot = footer_at(lines)
+    i = foot - 1
+    while i >= 0 and _blank(lines[i]):
+        i -= 1
+    if i < 0 or not CHAT_ROW.match(lines[i]):
+        return False
+    i -= 1
+    while i >= 0 and _blank(lines[i]):
+        i -= 1
+    if i >= 0 and NEXT_ROW.match(lines[i]):
+        i -= 1
+    if i < 0 or not FREE_TEXT.match(lines[i]):
+        return False
+    start = max((j for j in range(i) if lines[j].lstrip().startswith("●")), default=-1) + 1
+    region = lines[start:foot + 1]
+    if any("☒" in l or TICKED.search(l) for l in region):
+        return False
+    return not any("Notes:" in l for l in region) or any("press n to add notes" in l for l in region)
+
+
+def question_screen(svc: str, obj: str) -> list[str]:
+    return qdbus(svc, obj, "org.kde.konsole.Session.getAllDisplayedTextList", "true").splitlines()
+
+
+def _stamp(value) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def asked_again(account: str, sid: str, marker: str, since: float) -> bool:
+    path = transcript(account, sid)
+    if not path:
+        return False
+    for r in tail(path, 1 << 18):
+        if not is_prompt(r) or not r["message"]["content"].startswith(marker):
+            continue
+        at = _stamp(r.get("timestamp"))
+        if at is not None and at >= since - 1:
+            return True
+    return False
+
+
+def wait_asked(account: str, sid: str, marker: str, deadline: float, since: float) -> bool:
+    end = min(time.monotonic() + ASKED_WAIT, deadline)
+    while time.monotonic() < end:
+        if asked_again(account, sid, marker, since):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def deliver(tab: tuple[str, str], text: str, account: str, sid: str, deadline: float, since: float,
+            timeout: float = ASK_TIMEOUT) -> bool:
+    svc, obj = tab
+    marker = text[:text.index("]") + 1]
+    end = min(time.monotonic() + timeout, deadline - PROBE_ROOM)
+    while time.monotonic() < end:
+        screen = [ANSI.sub("", l) for l in question_screen(svc, obj)]
+        if time.monotonic() >= end:
+            return False
+        if footer_at(screen) < 0 and not has_unsent_text(svc, obj):
+            qdbus(svc, obj, "org.kde.konsole.Session.sendText", text)
+            time.sleep(0.5)
+            qdbus(svc, obj, "org.kde.konsole.Session.sendText", "\r")
+            break
+        time.sleep(1)
+    else:
+        return False
+    return wait_asked(account, sid, marker, deadline, since)
+
+
+def tab_of(s: dict, rec: dict | None) -> tuple[str, str] | None:
+    if rec and rec.get("konsole_service") and rec.get("konsole_session"):
+        return rec["konsole_service"], rec["konsole_session"]
+    if s["kind"] == "plain" and s.get("pid"):
+        env = {}
+        try:
+            for kv in Path(f"/proc/{s['pid']}/environ").read_bytes().split(b"\0"):
+                k, _, v = kv.partition(b"=")
+                env[k.decode()] = v.decode("utf-8", "replace")
+        except OSError:
+            return None
+        if env.get("KONSOLE_DBUS_SERVICE") and env.get("KONSOLE_DBUS_SESSION"):
+            return env["KONSOLE_DBUS_SERVICE"], env["KONSOLE_DBUS_SESSION"]
+    return None
+
+
+
+CLAUDE_TIMEOUT = Path(__file__).resolve().parent / "claude-timeout"
+TIMEOUT_BACKSTOP = 55
+
+
+def guarded(argv: list[str], timeout: float) -> tuple[list[str], float]:
+    wrapper = str(CLAUDE_TIMEOUT)
+    if (not os.path.isfile(wrapper) or not os.access(wrapper, os.X_OK)
+            or isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout)):
+        return argv, timeout
+    return [wrapper, f"{max(float(timeout), 0.001):.3f}", "--", *argv], timeout + TIMEOUT_BACKSTOP
+
+
+def claude(account: str, *args: str, cwd: str | None = None, timeout: float = 30) -> subprocess.CompletedProcess:
+    argv = ["claude", *args]
+    wrapped, own = guarded(argv, timeout)
+    res = subprocess.run(wrapped, env=DK.claude_env(account), cwd=cwd, capture_output=True,
+                         text=True, timeout=own, stdin=subprocess.DEVNULL)
+    if wrapped is not argv and res.returncode == 124:
+        raise subprocess.TimeoutExpired(argv, timeout, output=res.stdout, stderr=res.stderr)
+    return res
+
+
+@contextmanager
+def bg_start_locked(account: str, wait: float):
+    fd = None
+    if account and Path(account).name == account and account not in (".", ".."):
+        try:
+            Path(DK.RECORDS).mkdir(parents=True, exist_ok=True)
+            fd = os.open(Path(DK.RECORDS) / f".bg-start-{account}.lock", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+        except OSError:
+            fd = None
+    try:
+        if fd is not None:
+            end = time.monotonic() + max(0.0, wait)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if not time.monotonic() < end:
+                        break
+                    time.sleep(0.05)
+                except OSError:
+                    break
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def wait_listed(account: str, short_id: str, seconds: float) -> bool:
+    end = time.monotonic() + max(0.0, seconds)
+    first = True
+    unread = 0
+    while True:
+        if not first:
+            if end - time.monotonic() - 0.4 < 1.0:
+                break
+            time.sleep(0.4)
+        first = False
+        rows = agents_within(account, end - time.monotonic())
+        unread = unread + 1 if rows is None else 0
+        if any(isinstance(r, dict) and r.get("kind") == "background" and r.get("id") == short_id and r.get("status")
+               and r.get("state") != "stopped" for r in rows or []):
+            return True
+        if unread >= 3:
+            break
+    return False
+
+
+def start_bg(account: str, sid: str, f: dict, model: str | None, prompt: str | None,
+             timeout: float | None = None) -> str | None:
+    args = ["--bg"]
+    if f["mode"]:
+        args += ["--permission-mode", f["mode"]]
+    args += ["--resume", sid]
+    if model:
+        args += ["--model", model]
+    if f.get("effort"):
+        args += ["--effort", f["effort"]]
+    if prompt:
+        args.append(prompt)
+    budget = START_TIMEOUT if timeout is None else timeout
+    end = time.monotonic() + budget
+    with bg_start_locked(account, min(BG_LOCK_WAIT, budget / 2)):
+        new = _start_bg_locked(account, args, f, max(0.0, end - time.monotonic()))
+        if new:
+            wait_listed(account, new, min(BG_NAMED_WAIT, max(0.0, end - time.monotonic())))
+    return new
+
+
+def _start_bg_locked(account: str, args: list[str], f: dict, timeout: float) -> str | None:
+    try:
+        res = claude(account, *args, cwd=f["cwd"] or None, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    text = ANSI.sub("", res.stdout or "")
+    m = next(filter(None, map(START_LINE.match, text.splitlines())), None) or LOOSE_START.search(text)
+    return m.group(1) if m and res.returncode == 0 else None
+
+
+def soft_note(text: str) -> None:
+    if text not in SOFT_NOTES:
+        SOFT_NOTES.append(text)
+
+
+def renumbered(line: bytes, old: str, own: str) -> bytes:
+    body = line.rstrip(b"\r\n")
+    try:
+        obj = json.loads(body)
+    except (ValueError, RecursionError):
+        return line
+    if not isinstance(obj, dict) or obj.get("sessionId") != old:
+        return line
+    obj["sessionId"] = own
+    try:
+        try:
+            text = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except UnicodeEncodeError:
+            text = json.dumps(obj, separators=(",", ":")).encode("ascii")
+    except RecursionError:
+        return line
+    return text + line[len(body):]
+
+
+CARRY_TMP = ".carry-tmp"
+
+
+def carry_note(what: str, problems: list[str], detail: str | None = None) -> None:
+    prefix = f"{what} not fully copied"
+    SOFT_NOTES[:] = [n for n in SOFT_NOTES if not n.startswith(prefix)]
+    if detail:
+        soft_note(f"{prefix}: {detail}")
+    elif problems:
+        soft_note(f"{prefix}: {len(problems)} file(s), first {problems[0][:120]}")
+
+
+def carry_tree(src_dir: Path, dest_dir: Path, skip_top=(), link: bool = True) -> list[str]:
+    problems: list[str] = []
+    if src_dir.is_symlink() or not src_dir.is_dir():
+        return problems
+
+    def one(rel: str) -> None:
+        src, dest = src_dir / rel, dest_dir / rel
+        try:
+            try:
+                have = src.lstat()
+            except FileNotFoundError:
+                return
+            try:
+                there = dest.lstat()
+            except FileNotFoundError:
+                there = None
+            if there is not None and stat.S_ISREG(there.st_mode) and (
+                    (there.st_dev, there.st_ino) == (have.st_dev, have.st_ino) or there.st_mtime_ns >= have.st_mtime_ns):
+                return
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(f".{dest.name}{CARRY_TMP}")
+            tmp.unlink(missing_ok=True)
+            try:
+                if link:
+                    try:
+                        os.link(src, tmp)
+                    except OSError:
+                        shutil.copy2(src, tmp)
+                else:
+                    shutil.copy2(src, tmp)
+                os.replace(tmp, dest)
+            except BaseException:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            problems.append(f"{rel}: {type(e).__name__}")
+
+    def walk(rel: str) -> None:
+        try:
+            with os.scandir(src_dir / rel if rel else src_dir) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as e:
+            problems.append(f"{rel or '.'}: {type(e).__name__}")
+            return
+        for e in entries:
+            if e.name.endswith((".lock", CARRY_TMP)) or (not rel and e.name in skip_top):
+                continue
+            sub = f"{rel}/{e.name}" if rel else e.name
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    walk(sub)
+                elif e.is_file(follow_symlinks=False):
+                    one(sub)
+            except OSError as exc:
+                problems.append(f"{sub}: {type(exc).__name__}")
+
+    walk("")
+    return problems
+
+
+def mirror_deleted_tasks(src_dir: Path, dest_dir: Path) -> list[str]:
+    problems: list[str] = []
+    try:
+        if stat.S_ISLNK(os.lstat(src_dir).st_mode):
+            return problems
+        with os.scandir(src_dir) as it:
+            keep = {e.name for e in it}
+    except (FileNotFoundError, NotADirectoryError):
+        return problems
+    except OSError as e:
+        return [f"source: {type(e).__name__}"]
+    try:
+        with os.scandir(dest_dir) as it:
+            names = sorted(e.name for e in it if e.name.endswith(".json") and e.is_file(follow_symlinks=False))
+    except (FileNotFoundError, NotADirectoryError):
+        return problems
+    except OSError as e:
+        return [f".: {type(e).__name__}"]
+    for name in names:
+        if name in keep:
+            continue
+        try:
+            os.unlink(dest_dir / name)
+        except OSError as e:
+            problems.append(f"{name}: {type(e).__name__}")
+    return problems
+
+
+def remove_stale_copies(folder: Path, name: str) -> None:
+    stale = re.compile(r"\." + re.escape(name) + r"\.[0-9]+\.tmp")
+    try:
+        with os.scandir(folder) as it:
+            entries = list(it)
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if stale.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
+                os.unlink(entry.path)
+        except OSError:
+            pass
+
+
+def copy_transcript(src: Path, to: str, *, final: bool = False, as_id: str | None = None,
+                    for_itself: bool = False) -> None:
+    own = as_id or src.stem
+    renamed = own != src.stem
+    name = f"{own}.jsonl"
+
+    def kind(what: str) -> str:
+        return f"its own {what} on {to}" if for_itself else what
+    dest = DK.ACCTS / to / "projects" / src.parent.name
+    dest.mkdir(parents=True, exist_ok=True)
+    remove_stale_copies(dest, name)
+    tmp = dest / f".{name}.{os.getpid()}.tmp"
+    try:
+        if renamed:
+            marker = src.stem.encode()
+            with src.open("rb") as fin, tmp.open("wb") as fout:
+                for line in fin:
+                    fout.write(renumbered(line, src.stem, own) if marker in line else line)
+            shutil.copystat(src, tmp)
+        else:
+            shutil.copy2(src, tmp)
+        os.replace(tmp, dest / name)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    folder = src.with_suffix("")
+    carry_note(kind("conversation folder"), carry_tree(folder, dest / own, link=not renamed))
+    try:
+        home = src.parents[2]
+    except IndexError:
+        return
+    sid, there = src.stem, DK.ACCTS / to
+    problems = carry_tree(home / "tasks" / sid, there / "tasks" / own, link=not renamed)
+    if final:
+        mirrored = mirror_deleted_tasks(home / "tasks" / sid, there / "tasks" / own)
+        if any(p.startswith(".: ") for p in problems):
+            mirrored = [p for p in mirrored if not p.startswith("source: ")]
+        problems += mirrored
+    carry_note(kind("task list"), problems)
+    carry_note(kind("file history"), carry_tree(home / "file-history" / sid, there / "file-history" / own,
+                                                link=not renamed))
+
+
+def lacks_own_transcript(s: dict, tpath: Path) -> bool:
+    own = s["session_id"]
+    return tpath.stem != own and transcript(s["account"], own) is None
+
+
+def own_transcript(s: dict, tpath: Path) -> None:
+    if not lacks_own_transcript(s, tpath):
+        return
+    try:
+        copy_transcript(tpath, s["account"], as_id=s["session_id"], for_itself=True)
+    except Exception as e:
+        soft_note(f"its own transcript was not made on {s['account']}: {type(e).__name__}: {str(e)[:120]}")
+        return
+    s["own_made"] = True
+
+
+def carry_after_start(s: dict, tpath: Path, to: str, res: dict, deadline: float) -> None:
+    try:
+        home, there = DK.ACCTS / s["account"], DK.ACCTS / to
+        old, new = s["session_id"], res["session_id"]
+        own = to == s["account"]
+        if new != old:
+            slug_old, key = tpath.parent.name, tpath.stem
+            gone = transcript(to, new)
+            slug_new = gone.parent.name if gone else slug_old
+            carry_note("new session's conversation folder", carry_tree(
+                home / "projects" / slug_old / key, there / "projects" / slug_new / new, link=False))
+            if not any((there / "tasks" / new).glob("*.json")):
+                carry_note("new session's task list", carry_tree(home / "tasks" / key, there / "tasks" / new, link=False))
+            carry_note("new session's file history", carry_tree(
+                home / "file-history" / key, there / "file-history" / new, link=False))
+        if s["kind"] != "plain" and s.get("id") and (home / "jobs" / s["id"]).is_dir() \
+                and not (own and (not res.get("id") or res["id"] == s["id"])):
+            job = there / "jobs" / res["id"]
+            end = min(time.monotonic() + JOB_WAIT, deadline)
+            while not job.is_dir() and time.monotonic() < end:
+                time.sleep(0.25)
+            if job.is_dir():
+                carry_note("job folder", carry_tree(home / "jobs" / s["id"], job,
+                                                    skip_top={"state.json", "timeline.jsonl"}, link=(new == old)))
+            else:
+                carry_note("job folder", [], detail=f"it did not appear on {to}")
+    except Exception as e:
+        soft_note(f"carry after the start failed: {type(e).__name__}: {str(e)[:120]}")
+
+
+def carry_wanted(s: dict, to: str, res: dict) -> bool:
+    return to != s["account"] or bool(res.get("session_id")) and res["session_id"] != s["session_id"]
+
+
+def write_move_marker(session_id: str, to: str) -> None:
+    try:
+        LOCK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(LOCK_DIR, 0o700)
+        now = time.time()
+        for old in LOCK_DIR.iterdir():
+            try:
+                if "." not in old.name and old.is_file() and now - old.stat().st_mtime > MARKER_KEEP:
+                    old.unlink()
+            except OSError:
+                pass
+        marker = LOCK_DIR / session_id
+        marker.write_text(f"{int(now)} {to}\n")
+        os.chmod(marker, 0o600)
+    except OSError as e:
+        soft_note(f"move marker not written: {e}")
+
+
+def remove_move_marker(session_id: str) -> None:
+    try:
+        (LOCK_DIR / session_id).unlink(missing_ok=True)
+    except OSError as e:
+        soft_note(f"move marker not removed: {e}")
+
+
+PID_LIMIT = 2 ** 31 - 1
+
+
+def _wrapper_pid(rec: dict) -> int:
+    pid = rec.get("wrapper_pid")
+    if isinstance(pid, (bool, float)):
+        return 0
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return pid if 0 < pid <= PID_LIMIT else 0
+
+
+def _is_attach(raw: bytes) -> bool:
+    return b" attach " in raw.replace(b"\0", b" ") and b"claude-window" not in raw
+
+
+def attach_pids(rec: dict) -> list[int]:
+    pid = int(os.environ.get("CLAUDE_HUB_MOVE_ATTACH_OF") or 0)
+    if pid:
+        return [pid] if DK.pid_alive(pid) else []
+    wrapper = _wrapper_pid(rec)
+    return [c for c in (DK.children_of(wrapper) if wrapper else []) if _is_attach(DK.cmdline(c))]
+
+
+def end_attach(rec: dict) -> None:
+    for p in attach_pids(rec):
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def time_left(deadline: float | None) -> float:
+    return float("inf") if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+@contextmanager
+def records_locked(folder: Path, wait: float | None = None):
+    fd = os.open(Path(folder) / ".records.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        limit = RECORD_LOCK_WAIT if wait is None else max(0.0, min(RECORD_LOCK_WAIT, wait))
+        end = time.monotonic() + limit
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not time.monotonic() < end:
+                    raise OSError(f"the window's record is locked: {folder}/.records.lock was not free in "
+                                  f"{limit:g} s") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _write_record(path: Path, data: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=1))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def write_switch(rec: dict, to: str, model: str | None, cont: bool, effort: str | None = None,
+                 prompt: str | None = None, back: dict | None = None) -> None:
+    path = Path(rec["_path"])
+    with records_locked(path.parent):
+        data = json.loads(path.read_text())
+        data["switch"] = {"account": to, "resume": True, "model": model, "continue": cont}
+        if prompt:
+            data["switch"]["prompt"] = prompt
+        if effort:
+            data["switch"]["effort"] = effort
+        if back:
+            data["switch"]["back"] = back
+        _write_record(path, data)
+
+
+def clear_switch(rec: dict, wait: float | None = None) -> bool:
+    try:
+        path = Path(rec["_path"])
+        with records_locked(path.parent, wait):
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("switch"), dict):
+                return False
+            data.pop("switch")
+            _write_record(path, data)
+    except Exception:
+        return False
+    return True
+
+
+def take_back(rec: dict, deadline: float | None = None) -> bool:
+    return clear_switch(rec, time_left(deadline)) or clear_switch(rec, time_left(deadline))
+
+
+def _turn_switch(rec: dict, src: str, model: str | None, effort: str | None, prompt: str | None) -> bool:
+    try:
+        path = Path(rec["_path"])
+        with records_locked(path.parent):
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict) or not isinstance(data.get("switch"), dict):
+                return False
+            data["switch"] = {"account": src, "resume": True, "model": model, "continue": False}
+            if prompt:
+                data["switch"]["prompt"] = prompt
+            if effort:
+                data["switch"]["effort"] = effort
+            _write_record(path, data)
+    except Exception:
+        return False
+    return True
+
+
+def switch_back(rec: dict, src: str, model: str | None, effort: str | None = None, prompt: str | None = None) -> bool:
+    return _turn_switch(rec, src, model, effort, prompt) or _turn_switch(rec, src, model, effort, prompt)
+
+
+def wrapper_is_script(rec: dict) -> bool:
+    pid = _wrapper_pid(rec)
+    return bool(pid) and DK.pid_alive(pid) and b"claude-window" in DK.cmdline(pid)
+
+
+def wrapper_left_shell(rec: dict) -> bool:
+    pid = _wrapper_pid(rec)
+    if not pid or not DK.pid_alive(pid):
+        return False
+    raw = DK.cmdline(pid)
+    return bool(raw.strip(b"\0")) and b"claude-window" not in raw
+
+
+def shows_attach_view(rec: dict) -> bool:
+    return wrapper_is_script(rec) and bool(attach_pids(rec))
+
+
+def arm_switch_back(rec: dict, src: str, model: str | None, effort: str | None = None, prompt: str | None = None,
+                    deadline: float | None = None) -> bool:
+    try:
+        path = Path(rec["_path"])
+        with records_locked(path.parent, time_left(deadline)):
+            if not shows_attach_view(rec):
+                return False
+            data = json.loads(path.read_text())
+            if not isinstance(data, dict):
+                return False
+            data["switch"] = {"account": src, "resume": True, "model": model, "continue": False}
+            if prompt:
+                data["switch"]["prompt"] = prompt
+            if effort:
+                data["switch"]["effort"] = effort
+            _write_record(path, data)
+    except Exception:
+        return False
+    return True
+
+
+def window_can_restart(rec: dict, s: dict, tpath: Path) -> bool:
+    return resume_id(s, tpath) == s["session_id"] and wrapper_is_script(rec)
+
+
+def running_on(account: str, sid: str, timeout: float | None = None) -> bool | None:
+    end = time.monotonic() + (LOOK_WAIT if timeout is None else timeout)
+    read, first = False, True
+    while first or time.monotonic() < end:
+        first = False
+        rows = agents_within(account, time_left(end))
+        if rows is not None:
+            read = True
+            if any(r.get("sessionId") == sid and r.get("status") for r in rows):
+                return True
+        time.sleep(min(0.5, time_left(end)))
+    return False if read else None
+
+
+def wait_for_window(account: str, sid: str, rec: dict, deadline: float | None,
+                    stale: tuple[str, int] | None = None) -> dict | None:
+    left = WINDOWED_WAIT if deadline is None else min(WINDOWED_WAIT, deadline - time.monotonic())
+    return wait_running(account, sid, timeout=max(left, 0.1), stale=stale, rec=rec)
+
+
+def follows_back(rec: dict) -> bool:
+    return bool(rec) and rec.get("follows_back") is True and wrapper_is_script(rec)
+
+
+def window_left(deadline: float | None) -> float:
+    return max(WINDOWED_WAIT if deadline is None else min(WINDOWED_WAIT, deadline - time.monotonic()), 0.1)
+
+
+def wait_window(to: str, src: str, sid: str, rec: dict, timeout: float,
+                stale_to: tuple[str, int] | None = None,
+                stale_src: tuple[str, int] | None = None) -> tuple[str, dict] | None:
+    end = time.monotonic() + timeout
+    first = True
+    while first or time.monotonic() < end:
+        for account, stale in ((to, stale_to), (src, stale_src)):
+            if not first and time.monotonic() >= end:
+                return None
+            row = firm_row(agents_within(account, time_left(end)) or [], sid, rec, account, stale)
+            if row:
+                return account, row
+        first = False
+        time.sleep(min(0.5, time_left(end)))
+    return None
+
+
+def wait_taken(to: str, src: str | None, sid: str, rec: dict, deadline: float | None,
+               stale_to: tuple[str, int] | None = None,
+               stale_src: tuple[str, int] | None = None) -> tuple[str, dict] | None:
+    if src is None:
+        row = wait_for_window(to, sid, rec, deadline, stale_to)
+        return (to, row) if row else None
+    return wait_window(to, src, sid, rec, window_left(deadline), stale_to, stale_src)
+
+
+def snapshot_or_none(account: str) -> set[tuple] | None:
+    rows = DK.agents(account)
+    return None if rows is None else {(r.get("kind"), r.get("id") or r.get("pid")) for r in rows}
+
+
+def under_shell(row: dict, shell: int) -> bool:
+    pid = row.get("pid")
+    return bool(row.get("kind") == "interactive" and isinstance(pid, int) and not isinstance(pid, bool) and pid > 1
+                and pid != shell and shell in DK.ancestors(pid))
+
+
+def wait_running(account: str, sid: str, timeout: float = WAIT_TIMEOUT, stale: tuple[str, int] | None = None,
+                 rec: dict | None = None, shell: int | None = None) -> dict | None:
+    end = time.monotonic() + timeout
+    first = True
+    while first or time.monotonic() < end:
+        first = False
+        rows = [r for r in agents_within(account, time_left(end)) or [] if not lingering(r, stale)]
+        row = next((r for r in rows if r.get("sessionId") == sid and r.get("status")), None)
+        if not row and rec is not None:
+            row = firm_row(rows, sid, rec, account, stale)
+        if not row and shell is not None:
+            row = next((r for r in rows if r.get("status") and under_shell(r, shell)), None)
+        if row:
+            return row
+        time.sleep(min(0.5, time_left(end)))
+    return None
+
+
+def session_result(old_sid: str, row: dict | None, short_id: str | None = None) -> dict:
+    new_sid = (row or {}).get("sessionId") or ""
+    new_id = (row or {}).get("id") or short_id or old_sid[:8]
+    if new_sid:
+        return {"id": new_id, "session_id": new_sid, "from_session_id": old_sid, "reason": ""}
+    return {"id": new_id, "session_id": old_sid, "from_session_id": old_sid,
+            "reason": "new session id unknown"}
+
+
+def agents_within(account: str, seconds: float) -> list[dict] | None:
+    try:
+        res = subprocess.run(["claude", "agents", "--json"], env=DK.claude_env(account), capture_output=True,
+                             text=True, timeout=min(15.0, max(1.0, seconds)), umask=DK.DESK_UMASK)
+        rows = json.loads(res.stdout) if res.returncode == 0 else None
+        return rows if isinstance(rows, list) else None
+    except Exception:
+        return None
+
+
+def started_row(account: str, short_id: str | None, deadline: float | None) -> dict | None:
+    if not short_id:
+        return None
+    rows = agents_within(account, time_left(deadline))
+    return next((r for r in rows or [] if isinstance(r, dict) and r.get("id") == short_id), None)
+
+
+def ident(row: dict) -> str:
+    return str(row.get("id") or f"a plain Claude, pid {row.get('pid')}")
+
+
+def window_ids(rec: dict, account: str) -> set[str]:
+    pid = _wrapper_pid(rec)
+    out: set[str] = set()
+    if not pid:
+        return out
+    try:
+        files = list(Path(rec["_path"]).parent.glob("*.json"))
+    except Exception:
+        return out
+    for p in files:
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        if (isinstance(data, dict) and _wrapper_pid(data) == pid and data.get("account") == account
+                and data.get("boot") == rec.get("boot") and isinstance(data.get("id"), str) and data["id"]):
+            out.add(data["id"])
+    return out
+
+
+def under_wrapper(row: dict, rec: dict) -> bool:
+    wrapper, pid = _wrapper_pid(rec), row.get("pid")
+    return bool(wrapper and row.get("kind") == "interactive" and isinstance(pid, int) and not isinstance(pid, bool)
+                and pid > 1 and pid != wrapper and wrapper in DK.ancestors(pid))
+
+
+def switch_armed(rec: dict) -> bool:
+    try:
+        data = json.loads(Path(rec["_path"]).read_text())
+    except Exception:
+        return False
+    return isinstance(data, dict) and isinstance(data.get("switch"), dict)
+
+
+def lingering(row: dict, stale: tuple[str, int] | None) -> bool:
+    if not stale or not stale[0] or not isinstance(row, dict) or row.get("id") != stale[0]:
+        return False
+    pid = row.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return True
+    return pid == stale[1] or not DK.pid_alive(pid)
+
+
+def firm_row(rows: list[dict], sid: str, rec: dict | None, account: str,
+             stale: tuple[str, int] | None = None) -> dict | None:
+    live = [r for r in rows if isinstance(r, dict) and r.get("status") and not lingering(r, stale)]
+    row = next((r for r in live if r.get("sessionId") == sid), None)
+    if row or rec is None:
+        return row
+    ids = window_ids(rec, account)
+    row = next((r for r in live if r.get("id") and r.get("id") in ids), None)
+    if row:
+        return row
+    return next((r for r in live if under_wrapper(r, rec) and wrapper_is_script(rec)), None)
+
+
+def look_for(account: str, sid: str, timeout: float, before: set[tuple] | None, rec: dict | None,
+             deadline: float | None = None, stale: tuple[str, int] | None = None) -> tuple[str, dict | None]:
+    end = time.monotonic() + max(timeout, 0.0)
+    if deadline is not None:
+        end = min(end, deadline)
+    read, loose, first = False, None, True
+    while first or time.monotonic() < end:
+        first = False
+        rows = agents_within(account, time_left(deadline))
+        if rows is not None:
+            read = True
+            row = firm_row(rows, sid, rec, account, stale)
+            if row:
+                return "firm", row
+            if loose is None:
+                loose = next((r for r in rows if isinstance(r, dict) and r.get("status")
+                              and ((before is not None
+                                    and (r.get("kind"), r.get("id") or r.get("pid")) not in before)
+                                   or (rec is not None and under_wrapper(r, rec)))), None)
+        pause = min(0.5, end - time.monotonic())
+        if pause > 0:
+            time.sleep(pause)
+    if loose:
+        return "loose", loose
+    return ("none", None) if read else ("unread", None)
+
+
+def restart_through_window(s: dict, rec: dict, tpath: Path, f: dict, to: str, restart: str | None, armed: bool,
+                           before: set[tuple] | None, before_src: set[tuple] | None,
+                           deadline: float | None, stopped: bool = False) -> str:
+    src, sid = s["account"], s["session_id"]
+    stale = (s.get("id") or "", s.get("pid") or 0) if stopped else None
+    left_in = left_in_record(src)
+
+    def runs(row: dict) -> str:
+        kept = armed and not take_back(rec, deadline) and switch_armed(rec)
+        return f"running on {src} again ({ident(row)})" + (left_in if kept else "")
+
+    if wrapper_is_script(rec):
+        kind, row = look_for(src, sid, 0, before_src, rec, deadline, stale)
+        if kind == "firm":
+            return Said(runs(row), row, src)
+        read = kind != "unread"
+        end_attach(rec)
+        end = time.monotonic() + max(min(WINDOWED_WAIT, time_left(deadline) - TAIL_RESERVE), 0.1)
+        while True:
+            kind, row = look_for(src, sid, max(SLICE_WAIT, 0.1), before_src, rec, deadline, stale)
+            read = read or kind != "unread"
+            if kind == "firm":
+                return Said(runs(row), row, src)
+            if not wrapper_is_script(rec):
+                break
+            if time.monotonic() >= end:
+                return (f"its window has not started it on {src} again yet; "
+                        + ("" if read else f"the list of Claudes on {src} could not be read; ")
+                        + (f"the switch back to {src} stays in its record for the window, and "
+                           if armed and switch_armed(rec) else "")
+                        + "nothing was started here")
+    return start_if_nowhere(s, rec, tpath, f, to, restart, armed, before, before_src, deadline, stale,
+                            wrapper_left_shell)
+
+
+def left_in_record(src: str) -> str:
+    return f"; the switch back to {src} could not be taken out of its record: check for a second copy"
+
+
+def window_still_open(rec: dict) -> bool:
+    return wrapper_is_script(rec) or wrapper_left_shell(rec)
+
+
+def start_if_nowhere(s: dict, rec: dict | None, tpath: Path, f: dict, to: str, restart: str | None, armed: bool,
+                     before: set[tuple] | None, before_src: set[tuple] | None, deadline: float | None,
+                     stale: tuple[str, int] | None, window_open, look_to: bool = True) -> str:
+    src, sid = s["account"], s["session_id"]
+    left_in = left_in_record(src)
+    went = armed and not take_back(rec, deadline)
+    kept = went and switch_armed(rec)
+    on_to = (look_for(to, sid, LOOK_WAIT, before, rec, deadline, stale if to == src else None) if look_to
+             else ("none", None))
+    if on_to[0] == "firm":
+        return Said(f"it is running on {to} again ({ident(on_to[1])})" + (left_in if kept else ""), on_to[1], to)
+    on_src = look_for(src, sid, WENT_LOOK_WAIT if went else LOOK_WAIT, before_src, rec, deadline, stale)
+    if on_src[0] == "firm":
+        return Said(f"it is running on {src} again ({ident(on_src[1])})" + (left_in if kept else ""), on_src[1], src)
+    if on_src[0] == "loose":
+        r = on_src[1]
+        new = before_src is not None and (r.get("kind"), r.get("id") or r.get("pid")) not in before_src
+        return (("a Claude that was not there before" if new else "a Claude typed in its window")
+                + f" runs on {src} ({ident(r)}) and may be this one, so nothing was started here; if it is another "
+                "Claude, this conversation is stopped" + (left_in if kept else ""))
+    for acct, (kind, row) in ((to, on_to), (src, on_src)):
+        if kind == "unread":
+            return (f"the list of Claudes on {acct} could not be read, so it was not started again"
+                    + (left_in if kept else ""))
+    if kept:
+        return f"the switch back to {src} could not be taken out of its record, so it was not started again on {src}"
+    if window_open is not None and not window_open(rec):
+        return f"its window is gone, so it was not started again on {src}"
+    if time_left(deadline) < START_MIN:
+        return f"no time was left to start it again on {src}"
+    back = start_bg(src, resume_id(s, tpath), f, model_flag(None, f), restart,
+                    timeout=min(START_TIMEOUT, time_left(deadline)))
+    if not back:
+        return f"and it did not start again on {src} either"
+    return Said(f"running on {src} again ({back})", started_row(src, back, deadline), src)
+
+
+def unstopped(s: dict, row, account: str | None) -> bool:
+    pid = s.get("pid")
+    if pid and account == s["account"] and isinstance(row, dict) and row.get("pid") == pid:
+        remove_move_marker(s["session_id"])
+        return True
+    return False
+
+
+def stop_failed(s: dict, told: str) -> Failed:
+    row = getattr(told, "row", None)
+    unstopped(s, row, getattr(told, "account", None))
+    return Failed(f"could not stop it on {s['account']}; " + told, row)
+
+
+def move_background(s: dict, rec: dict | None, tpath: Path, f: dict, to: str, model: str | None,
+                    prompt: str | None, *, kind: str = "", restart: str | None = None, typed: bool = False,
+                    deadline: float | None = None) -> dict:
+    src = s["account"]
+
+    def back_look() -> str | None:
+        return src if to != src and follows_back(rec) else None
+
+    if rec:
+        go_back = {"account": src, "model": model_flag(None, f), "effort": f.get("effort") or None, "prompt": restart}
+        write_switch(rec, to, model, bool(prompt) and not typed and kind not in ("question", "warned"),
+                     f.get("effort"), None if typed or prompt == CONTINUE else prompt, go_back)
+    write_move_marker(s["session_id"], to)
+    before = snapshot_or_none(to) if rec else None
+    before_src = snapshot_or_none(src) if rec else None
+    try:
+        stop_ok = claude(src, "stop", s["id"], timeout=STOP_TIMEOUT).returncode == 0
+    except subprocess.TimeoutExpired:
+        stop_ok = False
+    if not stop_ok:
+        if lacks_own_transcript(s, tpath):
+            rows = DK.agents(src)
+            if rows is not None and not any(r.get("sessionId") == s["session_id"] and r.get("status") for r in rows):
+                own_transcript(s, tpath)
+        taken = bool(rec) and not take_back(rec)
+        if taken:
+            if wait_running(src, s["session_id"], timeout=2):
+                remove_move_marker(s["session_id"])
+                raise Failed(f"could not stop it on {src}, and its window took the switch to {to}: "
+                             "check for a second copy")
+            seen = wait_taken(to, back_look(), s["session_id"], rec, deadline)
+            if seen and unstopped(s, seen[1], seen[0]):
+                raise Failed(f"could not stop it on {src} in time, and its window took the switch to {to}, but it "
+                             f"still runs on {seen[0]} ({ident(seen[1])}): check for a second copy", seen[1])
+            if seen and seen[0] == to:
+                return session_result(s["session_id"], seen[1])
+            if seen:
+                raise WentBack(f"could not stop it on {src} in time; its window took the switch to {to}, which would "
+                               f"not start it, and started it again on {src} ({ident(seen[1])})", seen[1])
+            raise Failed(f"could not stop it on {src} in time; its window took the switch, so it was not started "
+                         f"again on {src}, and it did not show up on {to}")
+        seen = running_on(src, s["session_id"])
+        if seen:
+            remove_move_marker(s["session_id"])
+            raise Failed(f"could not stop it on {src}; nothing changed")
+        if seen is None:
+            raise Failed(f"could not stop it on {src}, and the list of Claudes on {src} could not be read: it was not "
+                         "started again")
+        if rec:
+            own_transcript(s, tpath)
+            by_window = window_can_restart(rec, s, tpath)
+            if by_window or not wrapper_is_script(rec):
+                armed = by_window and arm_switch_back(rec, src, model_flag(None, f), f.get("effort"), restart,
+                                                      deadline)
+                told = restart_through_window(s, rec, tpath, f, to, restart, armed, before, before_src, deadline)
+            else:
+                told = start_if_nowhere(s, rec, tpath, f, to, restart, False, before, before_src, deadline, None,
+                                        window_still_open)
+            raise stop_failed(s, told)
+        told = start_if_nowhere(s, None, tpath, f, to, restart, False, None, None, deadline, None, None, look_to=False)
+        raise stop_failed(s, told)
+    own_transcript(s, tpath)
+    gone = (s.get("id") or "", s.get("pid") or 0)
+    gone_on_to = gone if to == src else None
+    started_on_to = False
+    try:
+        if to != src:
+            copy_transcript(current_transcript(s, tpath), to, final=True, as_id=s["session_id"])
+        if rec:
+            end_attach(rec)
+            go = back_look()
+            if go is None:
+                row = wait_running(to, s["session_id"], timeout=WINDOWED_WAIT, rec=rec, stale=gone_on_to)
+                seen = (to, row) if row else None
+            else:
+                seen = wait_window(to, go, s["session_id"], rec, WINDOWED_WAIT, gone_on_to, gone)
+            if not seen:
+                raise Failed(f"it was not seen running on {to}")
+            if seen[0] != to:
+                raise WentBack(f"{to} would not start it; its window started it again on {src} ({ident(seen[1])})",
+                               seen[1])
+            return session_result(s["session_id"], seen[1])
+        started_on_to = True
+        new = start_bg(to, s["session_id"], f, model, prompt)
+        if not new:
+            raise Failed(f"{to} would not start it")
+        row = next((r for r in (DK.agents(to) or []) if r.get("id") == new), None)
+        return session_result(s["session_id"], row, short_id=new)
+    except Exception as e:
+        if isinstance(e, WentBack):
+            raise
+        problem = str(e) if isinstance(e, Failed) else f"could not finish moving it to {to}: {e}"
+        if rec:
+            by_window = window_can_restart(rec, s, tpath)
+            if not (switch_back(rec, src, model_flag(None, f), f.get("effort"), restart) if by_window
+                    else take_back(rec)):
+                seen = wait_taken(to, back_look(), s["session_id"], rec, deadline, gone_on_to, gone)
+                if seen and seen[0] != to:
+                    raise WentBack(f"{problem}; its window started it again on {src} ({ident(seen[1])})",
+                                   seen[1]) from e
+                if seen:
+                    raise Failed(f"{problem}; it is running on {to} again ({ident(seen[1])})", seen[1]) from e
+                raise Failed(f"{problem}; its window took the switch, so it was not started again on {src}") from e
+            if by_window:
+                told = restart_through_window(s, rec, tpath, f, to, restart, True, before, before_src, deadline,
+                                              stopped=True)
+                raise Failed(f"{problem}; " + told, getattr(told, "row", None)) from e
+            if not wrapper_is_script(rec):
+                told = restart_through_window(s, rec, tpath, f, to, restart, False, before, before_src, deadline,
+                                              stopped=True)
+            else:
+                told = start_if_nowhere(s, rec, tpath, f, to, restart, False, before, before_src, deadline, gone,
+                                        window_still_open)
+            raise Failed(f"{problem}; " + told, getattr(told, "row", None)) from e
+        told = start_if_nowhere(s, None, tpath, f, to, restart, False, None, None, deadline, gone, None,
+                                look_to=started_on_to)
+        raise Failed(f"{problem}; " + told, getattr(told, "row", None)) from e
+
+
+def _runs_as_claude(pid: int) -> bool:
+    return DK.comm(pid) == "claude" or DK.cmdline(pid).split(b"\0", 1)[0].rsplit(b"/", 1)[-1] == b"claude"
+
+
+def tab_shell(tab: tuple[str, str]) -> int | None:
+    try:
+        said = qdbus(tab[0], tab[1], "org.kde.konsole.Session.processId").strip()
+        if not re.fullmatch(r"[0-9]+", said):
+            return None
+        shell = int(said)
+        return shell if 0 < shell <= PID_LIMIT else None
+    except Exception:
+        return None
+
+
+def tab_runs_claude(tab: tuple[str, str]) -> bool:
+    shell = tab_shell(tab)
+    if shell is None:
+        return False
+    try:
+        return any(_runs_as_claude(pid) for child in DK.children_of(shell) for pid in (child, *DK.children_of(child)))
+    except Exception:
+        return False
+
+
+def move_plain(s: dict, tab: tuple[str, str], tpath: Path, f: dict, to: str, model: str | None,
+               prompt: str | None, asking: bool = False, restart: str | None = None,
+               deadline: float | None = None) -> dict:
+    src = s["account"]
+    svc, obj = tab
+    send = lambda text: qdbus(svc, obj, "org.kde.konsole.Session.sendText", text)
+    argv = [a.decode() for a in DK.cmdline(s["pid"]).split(b"\0") if a]
+    said = {first_prompt(tpath), CONTINUE} - {""}
+    flags, skip = [], False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a in said or a.startswith(("[Auto-swapper, ", "[Account switch, ")):
+            continue
+        if a in ("--resume", "-r", "--model", "--effort"):
+            skip = True
+            continue
+        if a.startswith(("--resume=", "--model=", "-r=", "--effort=")):
+            continue
+        if a in ("--continue", "-c"):
+            continue
+        flags.append(a)
+    write_move_marker(s["session_id"], to)
+    if asking:
+        send("\x1b"); time.sleep(1.0)
+    send("\x03"); time.sleep(0.5)
+    send("\x03"); time.sleep(0.3)
+    send("/exit\r")
+    for nudge in ("eof", signal.SIGTERM, None):
+        end = time.monotonic() + CLOSE_WAIT
+        while time.monotonic() < end and DK.pid_alive(s["pid"]):
+            time.sleep(0.25)
+        if not DK.pid_alive(s["pid"]):
+            break
+        if nudge == "eof":
+            send("\x04")
+        elif nudge:
+            os.kill(s["pid"], nudge)
+    if DK.pid_alive(s["pid"]):
+        remove_move_marker(s["session_id"])
+        raise Failed("it would not close")
+    if to != src:
+        try:
+            copy_transcript(tpath, to, final=True)
+        except OSError:
+            pass
+
+    def relaunch(account: str, m: str | None, p: str | None) -> None:
+        cmd = [shutil.which("claude") or "claude", *flags, "--resume", s["session_id"]]
+        if m:
+            cmd += ["--model", m]
+        if f.get("effort"):
+            cmd += ["--effort", f["effort"]]
+        if p:
+            cmd.append(p)
+        env = f"CLAUDE_CONFIG_DIR={shlex.quote(str(DK.ACCTS / account))}"
+        if f.get("cwd"):
+            send(f"( cd -- {shlex.quote(f['cwd'])} 2>/dev/null; {env} exec {shlex.join(cmd)} )\r")
+        else:
+            send(f"{env} {shlex.join(cmd)}\r")
+
+    time.sleep(0.8)
+    shell = tab_shell(tab)
+    relaunch(to, model, prompt)
+    row = wait_running(to, s["session_id"], shell=shell)
+    if row:
+        return session_result(s["session_id"], row)
+    if tab_runs_claude(tab):
+        left = WINDOWED_WAIT if deadline is None else deadline - 5 - time.monotonic()
+        row = wait_running(to, s["session_id"], timeout=max(left, 0.1), shell=shell)
+        if row:
+            return session_result(s["session_id"], row)
+        raise Failed(f"{to} did not show it as running, but a Claude is running in its tab; nothing was typed into it")
+    relaunch(src, model_flag(None, f), restart)
+    back = wait_running(src, s["session_id"], shell=shell)
+    raise Failed(f"{to} would not start it; " + (f"started again on {src}" if back
+                                                  else f"and it did not start again on {src} either"), back)
+
+
+def set_up(account: str) -> bool:
+    try:
+        text = (DK.ACCTS / account / ".claude.json").read_text()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    try:
+        data = json.loads(text)
+    except Exception:
+        return True
+    return not isinstance(data, dict) or data.get("hasCompletedOnboarding") is True
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="claude-move")
+    ap.add_argument("session")
+    ap.add_argument("account")
+    ap.add_argument("--model")
+    how = ap.add_mutually_exclusive_group()
+    how.add_argument("--continue", dest="cont", action="store_true")
+    how.add_argument("--signed-out", dest="signed_out", action="store_true")
+    how.add_argument("--asking", action="store_true")
+    how.add_argument("--wake", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args(argv)
+    deadline = time.monotonic() + MOVE_BUDGET
+    since = time.time()
+    out = {"result": "", "reason": "", "from": "", "to": a.account, "id": "",
+           "session_id": "", "from_session_id": "", "wake": ""}
+
+    def done(result: str, reason: str, code: int) -> int:
+        reason = "; ".join(x for x in (reason, *SOFT_NOTES) if x)
+        if result != "moved":
+            out["wake"] = ""
+        out.update(result=result, reason=reason)
+        said = out.get("why") or reason
+        if a.json:
+            print(json.dumps(out))
+        else:
+            line = f"{result}: {said}" if said else result
+            print(f"{line}; woke: {out['wake']}" if out["wake"] else line)
+        return code
+
+    if a.account not in DK.accounts():
+        return done("refused", f"no account called {a.account}", 2)
+    if DK.paused(a.account):
+        return done("refused", f"{a.account} is paused", 3)
+    if not a.session.strip():
+        return done("refused", "no session id", 2)
+    snap = DK.gather()
+    s = next((x for x in snap.sessions if a.session in (x["session_id"], x.get("id"))), None)
+    if not s:
+        return done("refused", "not running", 3)
+    out["from"] = s["account"]
+    lock = acquire_lock(s["session_id"])
+    if lock is None:
+        why = lock_reason(s["session_id"])
+        if why:
+            out["why"] = why
+        return done("refused", "already being moved", 3)
+    try:
+        if s["account"] == a.account and not a.model and not a.cont:
+            return done("refused", "already there", 3)
+        if s["account"] != a.account and not set_up(a.account):
+            return done("refused", f"{a.account} is not set up yet: its first run was never finished", 3)
+        if not a.force and a.asking and s["status"] != "waiting":
+            return done("refused", "busy" if s["status"] == "busy" else "no longer waiting", 3)
+        sf = stop_facts(s) if a.cont or a.signed_out else None
+        stopped = (s["status"] == "busy" and s.get("state") == "blocked" and sf is not None
+                   and not sf["input_after"] and (sf["hit"] if a.cont else sf["signed_out"]))
+        if not a.force and not a.asking and s["status"] in ("busy", "waiting") and not stopped:
+            return done("refused", s["status"], 3)
+        if a.cont and not a.model and s["account"] == a.account and not (sf["hit"] and not sf["input_after"]):
+            return done("refused", "no longer stopped at its limit", 3)
+        tpath = transcript(s["account"], s["session_id"])
+        if not tpath and a.account != s["account"]:
+            tpath = resumed_from(s["account"], s)
+        if not tpath:
+            return done("refused", "no transcript", 3)
+        rec = snap.records.get(s["session_id"])
+        f = facts(tpath)
+        if a.account != s["account"]:
+            where = start_folder(s, rec, f)
+            if where and DK.trusts(a.account, where) is False:
+                return done("refused", f"{a.account} does not trust {where}", 3)
+        tab = tab_of(s, rec)
+        if a.asking and rec and not tab and not a.force:
+            return done("refused", "its question cannot be read", 3)
+        if tab and not a.force:
+            if a.asking:
+                if not question_untouched(question_screen(*tab)):
+                    return done("refused", "answer started", 3)
+            elif has_unsent_text(*tab):
+                return done("refused", "unsent text", 3)
+        mode = ("asking" if a.asking else "continue" if a.cont else "signed-out" if a.signed_out
+                else "wake" if a.wake else "")
+        wf = wake_facts(s, tpath) if mode else {"pending": 0, "hit": False, "warned": False}
+        kind, prompt, restart = wake_plan(mode, s, a.account, wf)
+        model = model_flag(a.model, f)
+        typed = a.asking and bool(rec)
+        try:
+            if a.account != s["account"]:
+                try:
+                    copy_transcript(tpath, a.account, as_id=s["session_id"])
+                except OSError as e:
+                    raise Failed(f"could not copy the conversation to {a.account}; nothing changed") from e
+            if s["kind"] == "plain":
+                if not tab:
+                    raise Failed("its terminal cannot be reached")
+                res = move_plain(s, tab, tpath, f, a.account, model, prompt, asking=(kind == "question"),
+                                 restart=restart, deadline=deadline)
+                out.update(id=res["id"], session_id=res["session_id"], from_session_id=res["from_session_id"],
+                           wake=kind)
+                if res.get("reason"):
+                    out["reason"] = res["reason"]
+                if carry_wanted(s, a.account, res):
+                    carry_after_start(s, current_transcript(s, tpath), a.account, res, deadline)
+            else:
+                res = move_background(s, rec, tpath, f, a.account, model, prompt, kind=kind, restart=restart,
+                                      typed=typed, deadline=deadline)
+                out.update(id=res["id"], session_id=res["session_id"], from_session_id=res["from_session_id"],
+                           wake=kind)
+                if res.get("reason"):
+                    out["reason"] = res["reason"]
+                if carry_wanted(s, a.account, res):
+                    carry_after_start(s, current_transcript(s, tpath), a.account, res, deadline)
+                note = ""
+                try:
+                    with DK.registry_lock():
+                        entries = DK.read_registry()
+                        for e in entries:
+                            if e.get("session_id") == s["session_id"]:
+                                e.update(account=a.account, id=out["id"], session_id=out["session_id"])
+                        DK.write_registry(entries)
+                except Exception as e:
+                    note = f"moved; desktop registry not updated: {e}"
+                asked = True
+                if typed:
+                    try:
+                        asked = bool(tab) and deliver(tab, prompt, a.account, out["session_id"], deadline, since)
+                    except Exception:
+                        asked = False
+                elif a.wake and rec and kind == "question":
+                    try:
+                        asked = wait_asked(a.account, out["session_id"], prompt[:prompt.index("]") + 1], deadline,
+                                           since)
+                    except Exception:
+                        asked = False
+                if not asked:
+                    out["wake"] = ""
+                    out["reason"] = "; ".join(x for x in (out["reason"], "question not asked again") if x)
+                if note:
+                    return done("moved", f"{out['reason']}; {note}" if out["reason"] else note, 0)
+        except Failed as e:
+            if e.row:
+                r = session_result(s["session_id"], e.row)
+                out.update(id=r["id"], session_id=r["session_id"], from_session_id=r["from_session_id"])
+            return done("failed", str(e), 1)
+        except Exception as e:
+            return done("failed", f"unexpected {type(e).__name__}: {e}", 1)
+        return done("moved", out["reason"], 0)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

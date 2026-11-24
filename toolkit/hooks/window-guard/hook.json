@@ -1,0 +1,7 @@
+{
+  "description": "Refuses shell commands that would open a visible terminal window",
+  "event": "PreToolUse",
+  "matcher": "Bash|PowerShell",
+  "timeout": 10,
+  "codex": { "matcher": "Bash" }
+}

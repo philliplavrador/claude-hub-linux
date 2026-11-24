@@ -1,0 +1,10 @@
+#!/bin/sh
+name=$(basename "$0")
+if [ "$name" = gio ] && [ "${1:-}" != open ]; then
+  for d in /usr/bin /bin; do [ -x "$d/gio" ] && exec "$d/gio" "$@"; done
+fi
+echo "claude-hub: not opening '$*' — agents never open windows on the user's screen." >&2
+echo "claude-hub: NOTHING OPENED (exit 0 is only so a dev server's --open carries on). For your own checks use the" >&2
+echo "claude-hub: Playwright / Chrome DevTools tools (hidden screen); to show the user a page, open it on your own desktop and say which one (claude-desks whoami)." >&2
+printf '%s refused: %s\n' "$(date '+%F %T') $name" "$*" >> "${XDG_STATE_HOME:-$HOME/.local/state}/claude-hub/agent-screen.log" 2>/dev/null
+exit 0
