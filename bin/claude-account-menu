@@ -121,7 +121,7 @@ fetch_usage() {
   [ -n "$tok" ] || { renew_pass "$n"; tok=$(access_token "$n"); }
   [ -n "$tok" ] || return 1
   reply=$(curl -s --max-time 8 -w '\n%{http_code}' -H "Authorization: Bearer $tok" \
-          -H 'anthropic-beta: oauth-2025-04-20' https://api.anthropic.com/api/oauth/usage 2>/dev/null)
+          -H 'anthropic-beta: oauth-2025-04-20' "${CLAUDE_HUB_AUTOSWAP_USAGE_URL:-https://api.anthropic.com/api/oauth/usage}" 2>/dev/null)
   code=${reply##*$'\n'}
   [ "$code" = 429 ] && return 2
   printf '%s' "${reply%$'\n'*}" | to_fields api > "$CACHE/usage-$n.tmp" &&

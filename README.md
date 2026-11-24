@@ -8,8 +8,9 @@ between your Claude subscriptions before one runs out, one KDE desktop per Claud
 > machine. Issues and fixes are welcome. Read `install.sh` before you run it: it installs packages with `sudo`, links
 > commands into `~/.local/bin`, enables systemd user services and loads KWin scripts.
 
-<!-- SCREENSHOT: the hub, with two accounts (add docs/hub.png and an image line here) -->
-*Screenshot of the hub: coming.*
+![The hub's usage view with two subscriptions, alpha and beta, each with its 5-hour and week meters](docs/hub.png)
+
+*The hub's usage view. The two subscriptions and their numbers are made up for this picture.*
 
 ## What you get
 
@@ -53,7 +54,7 @@ Options:
 ```text
 ./install.sh --parts hub,autoswap,desktops,toolkit   choose parts (default: all)
 ./install.sh --accounts work,home                    name your subscriptions up front
-./install.sh --yes                                   no questions
+./install.sh --yes                                   no questions (see below: it makes no accounts by itself)
 ./install.sh --dry-run                               show what it would do, change nothing
 ```
 
@@ -72,6 +73,14 @@ The installer:
    CLAUDE_CONFIG_DIR=~/.claude-accounts/<name> claude
    # then type /login and sign in with that subscription
    ```
+
+**Log out and back in once after installing.** The background services (the session list the hub reads, the
+desktops service) and the Meta+Return key start from your login, and only a new login gives them `~/.local/bin` on
+their PATH and the key binding. The installer adds `~/.local/bin` to the services' PATH for the current session, so the
+hub works at once, but log out and in anyway.
+
+`./install.sh --yes` asks nothing, so without `--accounts` it makes no accounts: the hub then shows none. Name them
+(`./install.sh --yes --accounts work,home`) or run it without `--yes` and answer the questions.
 
 Run `./install.sh` again after `git pull` to update; it only changes what changed. Commands to try afterwards:
 `claude-hub`, `claude-autoswap status`, `claude-desks list`.

@@ -102,15 +102,16 @@ write_if_changed() {
 }
 
 link_one() {   # link_one SRC DEST
-  local src=$1 dest=$2
+  local src=$1 dest=$2 did=linked redid=relinked
+  (( DRY )) && { did="would link"; redid="would relink"; }
   if [[ -L $dest ]]; then
     [[ $(readlink "$dest") == "$src" ]] && return 0
-    doit ln -sfn "$src" "$dest"; say "  relinked $(basename "$dest")"; return 0
+    doit ln -sfn "$src" "$dest"; say "  $redid $(basename "$dest")"; return 0
   fi
   if [[ -e $dest ]]; then
     say "  skipped $(basename "$dest"): $dest exists and is not a link (left alone)"; return 0
   fi
-  doit ln -s "$src" "$dest"; say "  linked $(basename "$dest")"
+  doit ln -s "$src" "$dest"; say "  $did $(basename "$dest")"
 }
 
 # ---- 1. the machine ----------------------------------------------------------------------------------------
@@ -253,6 +254,19 @@ if (( APPS )) && [[ -d $ROOT/systemd ]]; then
       to_enable+=("$n")
     fi
   done
+  # The user manager's PATH comes from the login that started it. Right after a first install it has no ~/.local/bin
+  # (where Claude Code puts `claude`), so a unit that runs `claude` would not find it until the next login: add it now.
+  if (( ! DRY )); then
+    mgr_path=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^PATH=//p' | head -n 1 || true)
+    case ":$mgr_path:" in
+      *":$BIN_DIR:"*) ;;
+      *) if systemctl --user set-environment "PATH=$BIN_DIR:${mgr_path:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"; then
+           say "  added $BIN_DIR to the background services' PATH for this session (it is there by itself after your next login)"
+         else
+           say "  warning: could not add $BIN_DIR to the background services' PATH; log out and in once"
+         fi;;
+    esac
+  fi
   doit systemctl --user daemon-reload
   for u in "${to_enable[@]}"; do
     doit systemctl --user enable --now "$u" || say "  warning: could not enable $u (see: systemctl --user status $u)"
@@ -422,6 +436,9 @@ if (( TOOLKIT )); then
   # Keep the toolkit's Codex delivery out of a home folder that has no Codex.
   codex_env=()
   [[ -d $HOME/.codex ]] || codex_env=(env "CODEX_HOME=$STORE/.state/codex-unused")
+  if (( ! DRY && ${#codex_env[@]} )); then
+    say "  note: Codex is not installed ($HOME/.codex is missing), so the 'Codex hook bridge skipped' warnings below are expected and harmless"
+  fi
   targets=("${ALL_ACCOUNTS[@]}")
   (( ${#targets[@]} )) || targets=("")      # no accounts yet: the default ~/.claude
   for d in "${targets[@]}"; do
@@ -503,4 +520,5 @@ if (( ${#ALL_ACCOUNTS[@]} )); then
   say
 fi
 say "Then try: claude-hub   (the popup)   |   claude-autoswap status   |   claude-desks list"
+say "Log out and back in once, so Meta+Return and the background services pick everything up."
 say "Run ./install.sh again after a git pull to update."
